@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { Feature, Project } from './projectModel'
-import { backupLocalStore, projectToFirestore, firestoreToProject, FIRESTORE_CHUNK_BYTES, joinGeometry, measureLocalProjects, migrateLocalProjects, ProjectRepository, ProjectRevisionConflictError, ProjectImportError, FirestoreWriteError, splitGeometry } from './projectRepository'
+import { backupLocalStore, projectToFirestore, firestoreToProject, FIRESTORE_BATCH_BYTE_LIMIT, FIRESTORE_BATCH_MUTATION_LIMIT, FIRESTORE_CHUNK_BYTES, joinGeometry, measureLocalProjects, migrateLocalProjects, ProjectRepository, ProjectRevisionConflictError, ProjectImportError, FirestoreWriteError, FirestoreMutationTooLargeError, splitGeometry, splitMutationsIntoBatches } from './projectRepository'
 import type { CloudProject, DocumentMutation, DocumentPath, ProjectRepositoryAdapter } from './projectRepository'
 
 const sampleProject = (id = 'europe-project'): Project => ({
@@ -98,6 +98,29 @@ describe('project Firestore repository', () => {
     expect(encoded.chunks.every((chunk) => new TextEncoder().encode(chunk).length < 180_000)).toBe(true)
     expect(FIRESTORE_CHUNK_BYTES).toBe(128 * 1024)
     expect(restored).toEqual(geometry)
+  })
+
+  it('splits large serialized Firestore mutations by estimated request bytes under the independent count limit', () => {
+    const mutations: DocumentMutation[] = Array.from({ length: 20 }, (_, index) => ({
+      path: { collection: 'geometryChunks', projectId: 'large-project', featureId: `feature-${index}`, chunkId: `chunk-${index}` },
+      data: { index, data: 'x'.repeat(500_000) },
+    }))
+    const batches = splitMutationsIntoBatches(mutations)
+
+    expect(batches.length).toBeGreaterThanOrEqual(2)
+    expect(batches.flatMap(({ mutations: batch }) => batch)).toEqual(mutations)
+    expect(batches.every(({ estimatedBytes, mutations: batch }) => estimatedBytes <= FIRESTORE_BATCH_BYTE_LIMIT && batch.length <= FIRESTORE_BATCH_MUTATION_LIMIT)).toBe(true)
+    expect(batches.reduce((total, { mutations: batch }) => total + batch.length, 0)).toBe(mutations.length)
+  })
+
+  it('rejects one mutation above the safe request limit with its document path and byte estimate', () => {
+    const mutation: DocumentMutation = {
+      path: { collection: 'geometryChunks', projectId: 'large-project', featureId: 'feature-oversized', chunkId: 'chunk-oversized' },
+      data: { data: 'x'.repeat(FIRESTORE_BATCH_BYTE_LIMIT) },
+    }
+
+    expect(() => splitMutationsIntoBatches([mutation])).toThrow(FirestoreMutationTooLargeError)
+    expect(() => splitMutationsIntoBatches([mutation])).toThrow(/feature-oversized\/geometryChunks\/chunk-oversized.*estimated.*limit/)
   })
 
   it('measures the exact local payload and geometry byte sizes before migration', () => {

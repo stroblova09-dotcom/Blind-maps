@@ -28,8 +28,9 @@ const describeImportError = (error: unknown) => {
     if (error.stage === 'Firestore read') return `Záloha je zachována, ale načtení seznamu z Firestore selhalo. ${error.message}`
     if (error.cause instanceof FirestoreWriteError) {
       const write = error.cause
-      if (write.code.includes('resource-exhausted')) return `Firestore odmítl zápis kvůli serverové kvótě při operaci „${write.stage}“ (${write.documentCount} dokumentových změn projektu „${error.projectName}“, kód ${write.code}). Záloha i localStorage jsou zachovány.`
-      if (write.code.includes('permission-denied')) return `Firestore Rules odmítla operaci „${write.stage}“ pro projekt „${error.projectName}“ (kód ${write.code}). Záloha i localStorage jsou zachovány.`
+      const diagnostic = `Dávka ${write.batchIndex}: ${write.documentCount} mutations, odhad ${formatByteSize(write.estimatedBytes)}; dokumenty: ${write.documentIds.join(', ')}.`
+      if (write.code.includes('resource-exhausted')) return `Firestore odmítl zápis kvůli serverové kvótě při operaci „${write.stage}“ projektu „${error.projectName}“ (kód ${write.code}). ${diagnostic} Záloha i localStorage jsou zachovány.`
+      if (write.code.includes('permission-denied')) return `Firestore Rules odmítla operaci „${write.stage}“ pro projekt „${error.projectName}“ (kód ${write.code}). ${diagnostic} Záloha i localStorage jsou zachovány.`
       return `Zápis do Firestore selhal ve fázi „${write.stage}“ projektu „${error.projectName}“ (${write.documentCount} dokumentových změn, kód ${write.code}). Záloha i localStorage jsou zachovány. ${write.message}`
     }
     return `Zápis projektu „${error.projectName}“ do Firestore selhal. Záloha i localStorage jsou zachovány. ${error.message}`

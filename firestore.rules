@@ -1,8 +1,23 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    match /users/{userId}/{document=**} {
-      allow read, write: if request.auth != null && request.auth.uid == userId;
+    match /users/{userId}/projects/{projectId} {
+      allow read, write: if request.auth != null
+        && request.auth.uid == userId;
+
+      match /features/{featureId} {
+        allow read, write: if request.auth != null
+          && request.auth.uid == userId;
+
+        match /geometryChunks/{chunkId} {
+          allow read, write: if request.auth != null
+            && request.auth.uid == userId;
+        }
+      }
+    }
+
+    match /publicShares/{shareId} {
+      allow read, write: if false;
     }
   }
 }

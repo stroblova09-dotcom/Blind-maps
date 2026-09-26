@@ -2,6 +2,11 @@ import type { Feature, Project } from './projectModel'
 import { normalizeProject } from './projectModel'
 
 export const FIRESTORE_CHUNK_BYTES = 128 * 1024
+export const FIRESTORE_BATCH_BYTE_LIMIT = 6 * 1024 * 1024
+export const FIRESTORE_BATCH_MUTATION_LIMIT = 400
+const FIRESTORE_REQUEST_ENVELOPE_ESTIMATE_BYTES = 4 * 1024
+const FIRESTORE_MUTATION_OVERHEAD_ESTIMATE_BYTES = 512
+const FIRESTORE_SERIALIZATION_SAFETY_FACTOR = 1.25
 const SAFE_DOCUMENT_BYTES = 512 * 1024
 
 export type CloudProject = { project: Project; revision: number; changeId: string; createdAt: number; updatedAt: number }
@@ -21,6 +26,7 @@ export type DocumentPath =
   | { collection: 'features'; projectId: string; featureId: string }
   | { collection: 'geometryChunks'; projectId: string; featureId: string; chunkId: string }
 export type DocumentMutation = { path: DocumentPath; data: Record<string, unknown> | null }
+export type SizedMutationBatch = { mutations: DocumentMutation[]; estimatedBytes: number }
 export type ProjectRepositoryAdapter = {
   getProject: (uid: string, projectId: string) => Promise<Record<string, unknown> | null>
   listProjects: (uid: string) => Promise<Array<{ id: string; data: Record<string, unknown> }>>
@@ -42,20 +48,79 @@ export class ProjectRevisionConflictError extends Error {
 
 export type FirestoreWriteStage = 'features/geometryChunks batch' | 'project metadata' | 'project delete batch'
 
+const documentPathId = (path: DocumentPath, uid = '{uid}') => path.collection === 'projects'
+  ? `/users/${uid}/projects/${path.projectId}`
+  : path.collection === 'features'
+    ? `/users/${uid}/projects/${path.projectId}/features/${path.featureId}`
+    : `/users/${uid}/projects/${path.projectId}/features/${path.featureId}/geometryChunks/${path.chunkId}`
+
+export class FirestoreMutationTooLargeError extends Error {
+  readonly documentPath: string
+  readonly estimatedBytes: number
+  readonly limitBytes: number
+
+  constructor(documentPath: string, estimatedBytes: number, limitBytes: number) {
+    super(`Single Firestore mutation for ${documentPath} is estimated at ${estimatedBytes} bytes, above the safe ${limitBytes}-byte batch limit.`)
+    this.name = 'FirestoreMutationTooLargeError'
+    this.documentPath = documentPath
+    this.estimatedBytes = estimatedBytes
+    this.limitBytes = limitBytes
+  }
+}
+
+export const estimateMutationBytes = (mutation: DocumentMutation, uid = '{uid}') => {
+  const serialized = JSON.stringify({ path: documentPathId(mutation.path, uid), data: mutation.data })
+  const utf8Bytes = new TextEncoder().encode(serialized).byteLength
+  return Math.ceil(utf8Bytes * FIRESTORE_SERIALIZATION_SAFETY_FACTOR) + FIRESTORE_MUTATION_OVERHEAD_ESTIMATE_BYTES
+}
+
+export const splitMutationsIntoBatches = (
+  mutations: DocumentMutation[],
+  maxMutations = FIRESTORE_BATCH_MUTATION_LIMIT,
+  maxBytes = FIRESTORE_BATCH_BYTE_LIMIT,
+  uid = '{uid}',
+): SizedMutationBatch[] => {
+  const batches: SizedMutationBatch[] = []
+  let current: DocumentMutation[] = []
+  let currentBytes = FIRESTORE_REQUEST_ENVELOPE_ESTIMATE_BYTES
+  for (const mutation of mutations) {
+    const mutationBytes = estimateMutationBytes(mutation, uid)
+    const standaloneBytes = FIRESTORE_REQUEST_ENVELOPE_ESTIMATE_BYTES + mutationBytes
+    if (standaloneBytes > maxBytes) {
+      throw new FirestoreMutationTooLargeError(documentPathId(mutation.path, uid), standaloneBytes, maxBytes)
+    }
+    if (current.length && (current.length >= maxMutations || currentBytes + mutationBytes > maxBytes)) {
+      batches.push({ mutations: current, estimatedBytes: currentBytes })
+      current = []
+      currentBytes = FIRESTORE_REQUEST_ENVELOPE_ESTIMATE_BYTES
+    }
+    current.push(mutation)
+    currentBytes += mutationBytes
+  }
+  if (current.length) batches.push({ mutations: current, estimatedBytes: currentBytes })
+  return batches
+}
+
 export class FirestoreWriteError extends Error {
   readonly stage: FirestoreWriteStage
   readonly projectId: string
   readonly documentCount: number
+  readonly estimatedBytes: number
+  readonly batchIndex: number
+  readonly documentIds: string[]
   readonly code: string
 
-  constructor(stage: FirestoreWriteStage, projectId: string, documentCount: number, cause: unknown) {
+  constructor(stage: FirestoreWriteStage, projectId: string, documentCount: number, estimatedBytes: number, batchIndex: number, documentIds: string[], cause: unknown) {
     const code = cause && typeof cause === 'object' && 'code' in cause ? String(cause.code) : 'unknown'
     const detail = cause instanceof Error ? cause.message : String(cause)
-    super(`Firestore ${stage} failed for project ${projectId} (${documentCount} document mutations, ${code}): ${detail}`, { cause })
+    super(`Firestore ${stage} failed for project ${projectId}, batch ${batchIndex} (${documentCount} mutations, estimated ${estimatedBytes} bytes, documents: ${documentIds.join(', ')}, ${code}): ${detail}`, { cause })
     this.name = 'FirestoreWriteError'
     this.stage = stage
     this.projectId = projectId
     this.documentCount = documentCount
+    this.estimatedBytes = estimatedBytes
+    this.batchIndex = batchIndex
+    this.documentIds = documentIds
     this.code = code
   }
 }
@@ -261,12 +326,14 @@ export class ProjectRepository {
       await this.commitInBatches(uid, mutations, project.id, 'features/geometryChunks batch')
     } catch (error) {
       if (error instanceof FirestoreWriteError) throw error
-      throw new FirestoreWriteError('features/geometryChunks batch', project.id, mutations.length, error)
+      if (error instanceof FirestoreMutationTooLargeError) throw error
+      throw new FirestoreWriteError('features/geometryChunks batch', project.id, mutations.length, estimateBatchBytes(mutations, uid), 1, mutations.map(({ path }) => documentPathId(path, uid)), error)
     }
     try {
       await this.adapter.commit(uid, [{ path: { collection: 'projects', projectId: project.id }, data: { ...metadata, id: project.id } }])
     } catch (error) {
-      throw new FirestoreWriteError('project metadata', project.id, 1, error)
+      const metadataMutation: DocumentMutation = { path: { collection: 'projects', projectId: project.id }, data: { ...metadata, id: project.id } }
+      throw new FirestoreWriteError('project metadata', project.id, 1, estimateBatchBytes([metadataMutation], uid), 1, [documentPathId(metadataMutation.path, uid)], error)
     }
     return { project: structuredClone(project), revision, changeId, createdAt, updatedAt }
   }
@@ -285,16 +352,19 @@ export class ProjectRepository {
   }
 
   private async commitInBatches(uid: string, mutations: DocumentMutation[], projectId: string, stage: FirestoreWriteStage) {
-    for (let offset = 0; offset < mutations.length; offset += 400) {
-      const batch = mutations.slice(offset, offset + 400)
+    const batches = splitMutationsIntoBatches(mutations, FIRESTORE_BATCH_MUTATION_LIMIT, FIRESTORE_BATCH_BYTE_LIMIT, uid)
+    for (const [index, sizedBatch] of batches.entries()) {
+      const batch = sizedBatch.mutations
       try {
         await this.adapter.commit(uid, batch)
       } catch (error) {
-        throw new FirestoreWriteError(stage, projectId, batch.length, error)
+        throw new FirestoreWriteError(stage, projectId, batch.length, sizedBatch.estimatedBytes, index + 1, batch.map(({ path }) => documentPathId(path, uid)), error)
       }
     }
   }
 }
+
+const estimateBatchBytes = (mutations: DocumentMutation[], uid: string) => FIRESTORE_REQUEST_ENVELOPE_ESTIMATE_BYTES + mutations.reduce((total, mutation) => total + estimateMutationBytes(mutation, uid), 0)
 
 export type LocalStorageLike = Pick<Storage, 'getItem' | 'setItem'>
 export const localBackupKey = (uid: string) => `atlas-memo-projects-v2.backup.${encodeURIComponent(uid)}`
