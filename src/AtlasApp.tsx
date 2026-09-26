@@ -1,24 +1,29 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { CircleMarker, GeoJSON, MapContainer, Polygon, Polyline, TileLayer, Tooltip, useMap, useMapEvents } from 'react-leaflet'
 import { Check, ChevronDown, Compass, Crosshair, Expand, MapPin, Moon, Pencil, Plus, Search, Share2, Sparkles, Sun, Target, Trash2, X } from 'lucide-react'
-import { compressToBase64, decompressFromBase64 } from 'lz-string'
+import type { User } from 'firebase/auth'
 import type { Geometry as GeoJsonGeometry, GeoJsonObject, Position } from 'geojson'
 import type { LeafletMouseEvent, LatLng, LatLngBoundsExpression, LatLngExpression, LatLngLiteral, Map as LeafletMap } from 'leaflet'
+import { isFirebaseConfigured } from './lib/firebaseConfig'
+import { normalizeProject, parseProjectStore, STORE_KEY } from './projectModel'
+import { backupLocalStore, measureLocalProjects, migrateLocalProjects } from './projectRepository'
+import type { CloudProject, ProjectRepository } from './projectRepository'
+import type { Continent, Feature, PlaceType, Project, Store } from './projectModel'
+import { decodeSharedProject, encodeSharedProject, SHARE_URL_LIMIT } from './shareCodec'
 import './App.css'
 import './theme.css'
 
-type Continent = 'europe' | 'asia' | 'africa' | 'americas' | 'oceania' | 'world'
-type PlaceType = '' | 'město' | 'řeka' | 'jezero' | 'pohoří' | 'stát' | 'památka' | 'jiný objekt'
-type Feature = { id: string; name: string; type: PlaceType; lat: number; lng: number; displayName?: string; geometry?: GeoJsonGeometry }
-type Project = { id: string; name: string; continent: Continent; features: Feature[]; mapLayer: 'blind' | 'normal'; displayMode: 'shape' | 'points'; testOrder: string[]; testIndex: number; stats: { answered: number; correct: number; wrong: number } }
-type SearchCandidate = { place_id: string; display_name: string; name: string; lat: string; lon: string; type?: string; class?: string; geojson?: GeoJsonGeometry }
-type Store = { version: 2; projects: Project[]; activeProjectId: string }
+type SearchCandidate = { place_id: string; display_name: string; name?: string; namedetails?: Record<string, string>; localizedName?: string; lat: string; lon: string; type?: string; class?: string; geojson?: GeoJsonGeometry }
 type HitEvent = { latlng: LatLng; containerPoint: { x: number; y: number }; map: LeafletMap }
+type AuthStatus = 'checking' | 'signed-out' | 'signing-in' | 'signing-out' | 'signed-in' | 'unconfigured' | 'error'
+type SyncConflict = { id: string; cloud: CloudProject | null }
 
-const STORE_KEY = 'atlas-memo-projects-v2'
 const THEME_KEY = 'atlas-memo-theme'
-const MAX_SHARE_URL_LENGTH = 12000
 const configuredPublicUrl = import.meta.env.VITE_PUBLIC_APP_URL?.trim()
+const formatByteSize = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(2)} MiB`
+const localizedSearchAliases: Record<string, { query: string; name: string }> = {
+  'floridský záliv': { query: 'Florida Bay', name: 'Floridský záliv' },
+}
 const continentData: Record<Continent, { label: string; short: string; center: LatLngLiteral; zoom: number; bounds: LatLngBoundsExpression }> = {
   europe: { label: 'Evropa', short: 'EU', center: { lat: 50.8, lng: 15.2 }, zoom: 4, bounds: [[34, -12], [72, 42]] },
   asia: { label: 'Asie', short: 'AS', center: { lat: 35, lng: 100 }, zoom: 3, bounds: [[0, 25], [78, 180]] },
@@ -29,64 +34,45 @@ const continentData: Record<Continent, { label: string; short: string; center: L
 }
 
 const makeProject = (name: string, continent: Continent): Project => ({ id: crypto.randomUUID(), name, continent, features: [], mapLayer: 'blind', displayMode: 'shape', testOrder: [], testIndex: 0, stats: { answered: 0, correct: 0, wrong: 0 } })
-const normalizeProject = (value: Partial<Project>): Project => ({
-  ...value,
-  id: value.id || crypto.randomUUID(),
-  name: value.name || 'Mapa bez názvu',
-  continent: value.continent && continentData[value.continent] ? value.continent : 'europe',
-  features: Array.isArray(value.features) ? value.features : [],
-  mapLayer: value.mapLayer === 'normal' ? 'normal' : 'blind',
-  displayMode: value.displayMode === 'points' ? 'points' : 'shape',
-  testOrder: Array.isArray(value.testOrder) ? value.testOrder : [],
-  testIndex: Number.isInteger(value.testIndex) && (value.testIndex as number) >= 0 ? value.testIndex as number : 0,
-  stats: { answered: value.stats?.answered ?? 0, correct: value.stats?.correct ?? 0, wrong: value.stats?.wrong ?? 0 },
-})
-const safeParse = (value: string | null): Store | null => {
-  try {
-    const parsed = value ? JSON.parse(value) as Partial<Store> : null
-    if (parsed?.version !== 2 || !Array.isArray(parsed.projects)) return null
-    const projects = parsed.projects.map((item) => normalizeProject(item))
-    if (!projects.length) return null
-    return { version: 2, projects, activeProjectId: projects.some((item) => item.id === parsed.activeProjectId) ? parsed.activeProjectId as string : projects[0]?.id ?? '' }
-  } catch { return null }
-}
 const starterStore = (): Store => { const project = makeProject('Moje první mapa', 'europe'); return { version: 2, projects: [project], activeProjectId: project.id } }
 const readTheme = () => { try { return localStorage.getItem(THEME_KEY) === 'dark' } catch { return false } }
-const toBase64Url = (value: string) => {
-  const bytes = new TextEncoder().encode(value)
-  let binary = ''
-  for (let index = 0; index < bytes.length; index += 0x8000) binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000))
-  return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '')
-}
-const encodeShare = (project: Project) => `lz1_${toBase64Url(compressToBase64(JSON.stringify(project)))}`
-const fromBase64Url = (value: string) => {
-  const base64 = value.replaceAll('-', '+').replaceAll('_', '/') + '='.repeat((4 - value.length % 4) % 4)
-  const binary = atob(base64)
-  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0))
-  return new TextDecoder('utf-8', { fatal: true }).decode(bytes)
-}
-const decodeShare = (token: string): Project => {
-  if (token.startsWith('lz1_')) {
-    const compressed = fromBase64Url(token.slice(4))
-    const json = decompressFromBase64(compressed)
-    if (!json) throw new Error('Shared project data is empty')
-    return JSON.parse(json) as Project
-  }
-  // Accept links from both previous share encodings, including raw base64 '+' characters.
-  const normalized = token.replaceAll(' ', '+')
-  try { return JSON.parse(fromBase64Url(normalized)) as Project }
-  catch { return JSON.parse(decodeURIComponent(atob(normalized))) as Project }
-}
 const makeSharedCopy = (source: Project): Project => ({ ...normalizeProject(JSON.parse(JSON.stringify(source)) as Project), id: crypto.randomUUID(), name: `${source.name} – kopie`, stats: { answered: 0, correct: 0, wrong: 0 }, testIndex: 0, testOrder: [] })
+const getCandidateName = (candidate: SearchCandidate) => candidate.localizedName
+  || candidate.namedetails?.['name:cs']
+  || candidate.namedetails?.['loc_name:cs']
+  || candidate.namedetails?.['official_name:cs']
+  || candidate.namedetails?.['short_name:cs']
+  || candidate.display_name.split(',')[0]
+  || candidate.namedetails?.['name:en']
+  || candidate.name
+  || ''
+const searchCandidates = async (term: string, type: PlaceType, signal?: AbortSignal) => {
+  const trimmedTerm = term.trim()
+  const alias = localizedSearchAliases[trimmedTerm.toLocaleLowerCase('cs-CZ')]
+  const querySuffix: Partial<Record<PlaceType, string>> = { řeka: ' river', jezero: ' lake', pohoří: ' mountain range', stát: ' country' }
+  const searchTerm = alias?.query ?? `${trimmedTerm}${querySuffix[type] ?? ''}`
+  const params = new URLSearchParams({ format: 'jsonv2', polygon_geojson: '1', namedetails: '1', extratags: '1', limit: '10', 'accept-language': 'cs,en', q: searchTerm })
+  const response = await fetch(`https://nominatim.openstreetmap.org/search?${params}`, { signal })
+  if (!response.ok) throw new Error('Search failed')
+  const results = await response.json() as SearchCandidate[]
+  const category: Partial<Record<PlaceType, string[]>> = { řeka: ['river', 'stream', 'waterway'], jezero: ['lake', 'reservoir', 'water'], pohoří: ['mountain_range', 'mountain'], stát: ['administrative', 'country'] }
+  return results
+    .map((candidate) => alias ? { ...candidate, localizedName: alias.name } : candidate)
+    .sort((a, b) => {
+      const rank = (candidate: SearchCandidate) => (candidate.geojson && candidate.geojson.type !== 'Point' ? 2 : 0) + (category[type]?.some((value) => `${candidate.type} ${candidate.class}`.toLowerCase().includes(value)) ? 4 : 0)
+      return rank(b) - rank(a)
+    })
+    .slice(0, 7)
+}
 const loadStore = (): Store => {
   let storedValue: string | null = null
   try { storedValue = localStorage.getItem(STORE_KEY) } catch { /* Continue with an in-memory project if storage is unavailable. */ }
-  const saved = safeParse(storedValue)
+  const saved = parseProjectStore(storedValue)
   const sharedToken = window.location.hash.slice(1).split('&').map((part) => part.split('='))
     .find(([key]) => key === 'shared')?.[1]
   if (sharedToken) {
     try {
-      const sharedProject = normalizeProject(decodeShare(decodeURIComponent(sharedToken)))
+      const sharedProject = normalizeProject(decodeSharedProject(decodeURIComponent(sharedToken)) as unknown as Partial<Project>)
       const base = saved ?? starterStore()
       const copy = makeSharedCopy(sharedProject)
       window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`)
@@ -194,6 +180,26 @@ function App() {
   const [newProjectContinent, setNewProjectContinent] = useState<Continent>('europe')
   const [darkMode, setDarkMode] = useState(readTheme)
   const [saveStatus, setSaveStatus] = useState<'saving' | 'saved' | 'error'>('saving')
+  const [firebaseUser, setFirebaseUser] = useState<User | null>(null)
+  const [authStatus, setAuthStatus] = useState<AuthStatus>(isFirebaseConfigured ? 'checking' : 'unconfigured')
+  const [authError, setAuthError] = useState('')
+  const [syncStatus, setSyncStatus] = useState<'signed-out' | 'loading' | 'choice' | 'ready' | 'syncing' | 'error'>('signed-out')
+  const [syncPrompt, setSyncPrompt] = useState<'import' | 'choose' | null>(null)
+  const [syncError, setSyncError] = useState('')
+  const [syncConflicts, setSyncConflicts] = useState<SyncConflict[]>([])
+  const [cloudProjects, setCloudProjects] = useState<CloudProject[]>([])
+  const [hasLocalData, setHasLocalData] = useState(false)
+  const [localMeasurement, setLocalMeasurement] = useState<ReturnType<typeof measureLocalProjects> | null>(null)
+  const [syncTick, setSyncTick] = useState(0)
+  const [cloudReady, setCloudReady] = useState(false)
+  const searchRequestId = useRef(0)
+  const storeRef = useRef(store)
+  const cloudReadyRef = useRef(false)
+  const cloudBaselineRef = useRef(new Map<string, CloudProject>())
+  const conflictsRef = useRef(new Set<string>())
+  const savesInFlightRef = useRef(new Set<string>())
+  const localRawStoreRef = useRef<string | null>(null)
+  const repositoryRef = useRef<ProjectRepository | null>(null)
   const project = store.projects.find((item) => item.id === store.activeProjectId) ?? store.projects[0]
   const continent = continentData[project.continent]
   const target = project.features.find((feature) => feature.id === project.testOrder[project.testIndex])
@@ -206,12 +212,220 @@ function App() {
     const timer = window.setTimeout(() => setSaveStatus(result), 0)
     return () => window.clearTimeout(timer)
   }, [store])
+  useEffect(() => { storeRef.current = store }, [store])
+  useEffect(() => {
+    const retryPendingSync = () => setSyncTick((value) => value + 1)
+    window.addEventListener('online', retryPendingSync)
+    return () => window.removeEventListener('online', retryPendingSync)
+  }, [])
   useEffect(() => { try { localStorage.setItem(THEME_KEY, darkMode ? 'dark' : 'light') } catch { /* Theme preference is optional. */ } }, [darkMode])
+  useEffect(() => {
+    if (!isFirebaseConfigured) return
+    let cancelled = false
+    let unsubscribe: (() => void) | undefined
+    import('./lib/firebase').then(({ observeFirebaseUser }) => {
+      if (cancelled) return
+      unsubscribe = observeFirebaseUser((user) => {
+        setFirebaseUser(user)
+        setAuthStatus(user ? 'signed-in' : 'signed-out')
+        setAuthError('')
+      }, (error) => {
+        setFirebaseUser(null)
+        setAuthStatus('error')
+        setAuthError(error.message)
+      })
+    }).catch((error: unknown) => {
+      if (cancelled) return
+      setAuthStatus('error')
+      setAuthError(error instanceof Error ? error.message : 'Firebase Auth se nepodařilo načíst.')
+    })
+    return () => { cancelled = true; unsubscribe?.() }
+  }, [])
+  useEffect(() => {
+    if (!firebaseUser) {
+      cloudReadyRef.current = false
+      cloudBaselineRef.current.clear()
+      conflictsRef.current.clear()
+      return
+    }
+    let cancelled = false
+    let initialized = false
+    let unsubscribe: (() => void) | undefined
+    cloudReadyRef.current = false
+    cloudBaselineRef.current.clear()
+    conflictsRef.current.clear()
+    try { localRawStoreRef.current = localStorage.getItem(STORE_KEY) } catch { localRawStoreRef.current = null }
+    const savedLocalStore = parseProjectStore(localRawStoreRef.current)
+    queueMicrotask(() => {
+      if (cancelled) return
+      setCloudReady(false)
+      setSyncStatus('loading')
+      setSyncPrompt(null)
+      setSyncError('')
+      setSyncConflicts([])
+      setHasLocalData(Boolean(savedLocalStore))
+      setLocalMeasurement(savedLocalStore ? measureLocalProjects(localRawStoreRef.current ?? '', savedLocalStore.projects) : null)
+    })
+    import('./lib/firebaseProjectStore').then(({ projectRepository }) => {
+      if (cancelled) return
+      repositoryRef.current = projectRepository
+      unsubscribe = projectRepository.watchProjects(firebaseUser.uid, (remoteProjects) => {
+        if (cancelled) return
+        const next = new Map(remoteProjects.map((item) => [item.project.id, item]))
+        setCloudProjects(remoteProjects)
+        if (!initialized) {
+          initialized = true
+          cloudBaselineRef.current = next
+          if (remoteProjects.length) {
+            setSyncPrompt('choose')
+            setSyncStatus('choice')
+          } else if (savedLocalStore) {
+            setSyncPrompt('import')
+            setSyncStatus('choice')
+          } else {
+            cloudReadyRef.current = true
+            setCloudReady(true)
+            setSyncStatus('ready')
+          }
+          return
+        }
+        if (!cloudReadyRef.current) {
+          cloudBaselineRef.current = next
+          if (!remoteProjects.length) {
+            setSyncPrompt(savedLocalStore ? 'import' : null)
+            setSyncStatus(savedLocalStore ? 'choice' : 'ready')
+            if (!savedLocalStore) { cloudReadyRef.current = true; setCloudReady(true) }
+          }
+          return
+        }
+
+        const currentStore = storeRef.current
+        for (const remote of remoteProjects) {
+          const previous = cloudBaselineRef.current.get(remote.project.id)
+          const local = currentStore.projects.find((item) => item.id === remote.project.id)
+          if (conflictsRef.current.has(remote.project.id)) continue
+          if (!previous) {
+            if (!local) setStore((current) => ({ ...current, projects: [...current.projects, remote.project] }))
+          } else if ((remote.revision !== previous.revision || remote.changeId !== previous.changeId) && JSON.stringify(local) !== JSON.stringify(remote.project)) {
+            const localHasChanges = Boolean(local && JSON.stringify(local) !== JSON.stringify(previous.project))
+            if (localHasChanges) {
+              conflictsRef.current.add(remote.project.id)
+              setSyncConflicts((current) => current.some((item) => item.id === remote.project.id) ? current.map((item) => item.id === remote.project.id ? { id: remote.project.id, cloud: remote } : item) : [...current, { id: remote.project.id, cloud: remote }])
+            } else if (local) {
+              setStore((current) => ({ ...current, projects: current.projects.map((item) => item.id === remote.project.id ? remote.project : item) }))
+            }
+          }
+        }
+        for (const [id, previous] of cloudBaselineRef.current) {
+          if (next.has(id) || conflictsRef.current.has(id)) continue
+          const local = currentStore.projects.find((item) => item.id === id)
+          if (local && JSON.stringify(local) !== JSON.stringify(previous.project)) {
+            conflictsRef.current.add(id)
+            setSyncConflicts((current) => current.some((item) => item.id === id) ? current.map((item) => item.id === id ? { id, cloud: null } : item) : [...current, { id, cloud: null }])
+          } else if (local) {
+            setStore((current) => ({ ...current, projects: current.projects.filter((item) => item.id !== id) }))
+          }
+        }
+        cloudBaselineRef.current = next
+        setSyncStatus((current) => current === 'syncing' ? current : 'ready')
+      }, (error) => {
+        if (cancelled) return
+        setSyncError(error.message)
+        setSyncStatus('error')
+      })
+    }).catch((error: unknown) => {
+      if (cancelled) return
+      setSyncError(error instanceof Error ? error.message : 'Firestore se nepodařilo načíst.')
+      setSyncStatus('error')
+    })
+    return () => { cancelled = true; unsubscribe?.() }
+  }, [firebaseUser])
+  useEffect(() => {
+    if (!firebaseUser || !cloudReady || !repositoryRef.current) return
+    const repository = repositoryRef.current
+    const uid = firebaseUser.uid
+    let hasPending = false
+    for (const projectToSave of store.projects) {
+      const id = projectToSave.id
+      if (conflictsRef.current.has(id) || savesInFlightRef.current.has(id)) continue
+      const cloud = cloudBaselineRef.current.get(id)
+      if (cloud && JSON.stringify(cloud.project) === JSON.stringify(projectToSave)) continue
+      hasPending = true
+      savesInFlightRef.current.add(id)
+      let savedSuccessfully = false
+      setSyncStatus('syncing')
+      repository.saveProject(uid, projectToSave, cloud?.revision ?? 0).then((saved) => {
+        savedSuccessfully = true
+        cloudBaselineRef.current.set(id, saved)
+        setSyncError('')
+      }).catch((error: unknown) => {
+        if (error instanceof Error && error.name === 'ProjectRevisionConflictError') {
+          repository.listProjects(uid).then((latest) => {
+            const newer = latest.find((item) => item.project.id === id)
+            if (newer) {
+              cloudBaselineRef.current.set(id, newer)
+              conflictsRef.current.add(id)
+              setSyncConflicts((current) => current.some((item) => item.id === id) ? current.map((item) => item.id === id ? { id, cloud: newer } : item) : [...current, { id, cloud: newer }])
+            } else {
+              conflictsRef.current.add(id)
+              setSyncConflicts((current) => current.some((item) => item.id === id) ? current.map((item) => item.id === id ? { id, cloud: null } : item) : [...current, { id, cloud: null }])
+            }
+          }).catch((loadError: unknown) => {
+            setSyncError(loadError instanceof Error ? loadError.message : 'Cloudovou verzi se nepodařilo načíst.')
+            setSyncStatus('error')
+          })
+        } else {
+          setSyncError(error instanceof Error ? error.message : 'Projekt se nepodařilo synchronizovat.')
+          setSyncStatus('error')
+        }
+      }).finally(() => {
+        savesInFlightRef.current.delete(id)
+        if (savedSuccessfully) setSyncTick((value) => value + 1)
+      })
+    }
+    for (const [id, cloud] of cloudBaselineRef.current) {
+      if (store.projects.some((item) => item.id === id) || conflictsRef.current.has(id) || savesInFlightRef.current.has(id)) continue
+      hasPending = true
+      savesInFlightRef.current.add(id)
+      let deletedSuccessfully = false
+      setSyncStatus('syncing')
+      repository.deleteProject(uid, id).then(() => { deletedSuccessfully = true; cloudBaselineRef.current.delete(id) }).catch((error: unknown) => {
+        setSyncError(error instanceof Error ? error.message : 'Projekt se nepodařilo smazat z cloudu.')
+        setSyncStatus('error')
+      }).finally(() => {
+        savesInFlightRef.current.delete(id)
+        if (deletedSuccessfully) setSyncTick((value) => value + 1)
+      })
+      void cloud
+    }
+    if (!hasPending) setSyncStatus((current) => current === 'error' ? current : 'ready')
+  }, [firebaseUser, cloudReady, store.projects, syncTick])
   useEffect(() => {
     const controller = new AbortController()
     fetch('https://raw.githubusercontent.com/datasets/geo-countries/master/data/countries.geojson', { signal: controller.signal }).then((response) => response.ok ? response.json() as Promise<GeoJsonObject> : null).then(setBoundaryData).catch(() => setBoundaryData(null))
     return () => controller.abort()
   }, [])
+  useEffect(() => {
+    const term = query.trim()
+    if (mode !== 'edit' || term.length < 2) return
+    const requestId = ++searchRequestId.current
+    const controller = new AbortController()
+    const timer = window.setTimeout(() => {
+      setIsSearching(true)
+      setNotice('')
+      searchCandidates(term, placeType, controller.signal).then((results) => {
+        if (searchRequestId.current !== requestId) return
+        setCandidates(results)
+        if (!results.length) setNotice('Místo se nepodařilo najít. Zkus upřesnit název.')
+      }).catch((error: unknown) => {
+        if (error instanceof DOMException && error.name === 'AbortError') return
+        if (searchRequestId.current === requestId) setNotice('Vyhledávání se nepodařilo dokončit. Zkontroluj připojení.')
+      }).finally(() => {
+        if (searchRequestId.current === requestId) setIsSearching(false)
+      })
+    }, 800)
+    return () => { window.clearTimeout(timer); controller.abort() }
+  }, [query, placeType, mode])
 
   const updateProject = (updater: (current: Project) => Project) => setStore((current) => ({ ...current, projects: current.projects.map((item) => item.id === project.id ? updater(item) : item) }))
   const selectProject = (id: string) => { setStore((current) => ({ ...current, activeProjectId: id })); setMode('edit'); setFeedback('idle'); setSelectedId(null); setHoveredId(null); setCandidates([]); setNotice('') }
@@ -222,12 +436,136 @@ function App() {
     setStore((current) => { const remaining = current.projects.filter((item) => item.id !== project.id); const fallback = remaining[0] ?? makeProject('Moje první mapa', 'europe'); return { ...current, projects: remaining.length ? remaining : [fallback], activeProjectId: remaining[0]?.id ?? fallback.id } })
     setMode('edit'); setFeedback('idle'); setSelectedId(null)
   }
+  const handleProfileAction = async () => {
+    if (!isFirebaseConfigured) {
+      setAuthError('Doplň veřejnou Firebase Web konfiguraci do .env.local a do Vercelu.')
+      return
+    }
+    setAuthError('')
+    try {
+      const firebase = await import('./lib/firebase')
+      if (firebaseUser) {
+        setAuthStatus('signing-out')
+        await firebase.signOutFirebaseUser()
+      } else {
+        setAuthStatus('signing-in')
+        await firebase.signInWithGoogle()
+      }
+    } catch (error) {
+      const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : ''
+      setAuthStatus(firebaseUser ? 'signed-in' : 'signed-out')
+      const message = code === 'auth/popup-closed-by-user'
+        ? 'Přihlašovací okno bylo zavřeno.'
+        : code === 'auth/popup-blocked'
+          ? 'Prohlížeč zablokoval přihlašovací okno. Povol vyskakovací okna pro tento web a zkus to znovu.'
+          : code === 'auth/unauthorized-domain'
+            ? 'Tato doména není autorizována ve Firebase Console.'
+            : error instanceof Error ? error.message : 'Přihlášení se nepodařilo.'
+      setAuthError(message)
+    }
+  }
+  const refreshLocalStoreSnapshot = () => {
+    try {
+      localRawStoreRef.current = localStorage.getItem(STORE_KEY)
+      const parsed = parseProjectStore(localRawStoreRef.current)
+      setHasLocalData(Boolean(parsed))
+      setLocalMeasurement(parsed && localRawStoreRef.current ? measureLocalProjects(localRawStoreRef.current, parsed.projects) : null)
+    } catch {
+      localRawStoreRef.current = null
+      setHasLocalData(false)
+    }
+    return localRawStoreRef.current
+  }
+  const useCloudProjects = () => {
+    try {
+      const rawLocalStore = refreshLocalStoreSnapshot()
+      if (rawLocalStore) {
+        backupLocalStore(localStorage, firebaseUser?.uid ?? 'unknown', rawLocalStore)
+      }
+      const projects = cloudProjects.map((item) => item.project)
+      const savedStore = parseProjectStore(rawLocalStore)
+      cloudBaselineRef.current = new Map(cloudProjects.map((item) => [item.project.id, item]))
+      conflictsRef.current.clear()
+      setStore({ version: 2, projects, activeProjectId: projects.find((item) => item.id === savedStore?.activeProjectId)?.id ?? projects[0]?.id ?? '' })
+      cloudReadyRef.current = true
+      setCloudReady(true)
+      setSyncPrompt(null)
+      setSyncStatus('ready')
+      setSyncError('')
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : 'Záložní kopii lokálních projektů se nepodařilo vytvořit.')
+      setSyncStatus('error')
+    }
+  }
+  const importLocalProjects = async () => {
+    const rawLocalStore = refreshLocalStoreSnapshot()
+    if (!firebaseUser || !rawLocalStore || !repositoryRef.current) return
+    try {
+      const result = await migrateLocalProjects(repositoryRef.current, firebaseUser.uid, localStorage, rawLocalStore)
+      setLocalMeasurement(result.measurement)
+      const projects = await repositoryRef.current.listProjects(firebaseUser.uid)
+      cloudBaselineRef.current = new Map(projects.map((item) => [item.project.id, item]))
+      conflictsRef.current.clear()
+      const parsed = parseProjectStore(rawLocalStore)
+      setStore({ version: 2, projects: projects.map((item) => item.project), activeProjectId: projects.some((item) => item.project.id === parsed?.activeProjectId) ? parsed?.activeProjectId ?? projects[0]?.project.id ?? '' : projects[0]?.project.id ?? '' })
+      cloudReadyRef.current = true
+      setCloudReady(true)
+      setSyncPrompt(null)
+      setSyncStatus('ready')
+      setSyncError(`Import dokončen: ${result.measurement.projectCount} projektů, ${result.measurement.featureCount} míst; localStorage ${formatByteSize(result.measurement.localStoreBytes)}, geometrie ${formatByteSize(result.measurement.geometryBytes)}, největší tvar ${formatByteSize(result.measurement.largestGeometryBytes)}. ${result.skippedCount ? `${result.skippedCount} kolidujících ID zůstalo beze změny. ` : ''}Záloha: ${result.backupKey}`)
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : 'Migrace selhala. Původní localStorage zůstalo zachováno; import lze bezpečně opakovat.')
+      setSyncStatus('error')
+    }
+  }
+  const mergeLocalProjects = async () => {
+    const rawLocalStore = refreshLocalStoreSnapshot()
+    if (!firebaseUser || !rawLocalStore || !repositoryRef.current) return
+    try {
+      const result = await migrateLocalProjects(repositoryRef.current, firebaseUser.uid, localStorage, rawLocalStore)
+      setLocalMeasurement(result.measurement)
+      const projects = await repositoryRef.current.listProjects(firebaseUser.uid)
+      cloudBaselineRef.current = new Map(projects.map((item) => [item.project.id, item]))
+      conflictsRef.current.clear()
+      setStore({ version: 2, projects: projects.map((item) => item.project), activeProjectId: projects[0]?.project.id ?? '' })
+      cloudReadyRef.current = true
+      setCloudReady(true)
+      setSyncPrompt(null)
+      setSyncStatus('ready')
+      setSyncError(`Sloučení hotovo (${result.migrated.length} přidáno, ${result.skippedCount} existujících ID ponecháno). Místní localStorage ${formatByteSize(result.measurement.localStoreBytes)}, geometrie ${formatByteSize(result.measurement.geometryBytes)}, největší tvar ${formatByteSize(result.measurement.largestGeometryBytes)}. Záloha: ${result.backupKey}`)
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : 'Sloučení selhalo. Cloudové ani lokální projekty nebyly smazány; lze bezpečně opakovat.')
+      setSyncStatus('error')
+    }
+  }
+  const resolveCloudConflict = (id: string, useRemote: boolean) => {
+    const conflict = syncConflicts.find((item) => item.id === id)
+    if (!conflict) return
+    const { cloud } = conflict
+    conflictsRef.current.delete(id)
+    if (cloud) cloudBaselineRef.current.set(id, cloud)
+    else cloudBaselineRef.current.delete(id)
+    if (useRemote) {
+      if (cloud) {
+        setStore((current) => ({ ...current, projects: current.projects.some((item) => item.id === id) ? current.projects.map((item) => item.id === id ? cloud.project : item) : [...current.projects, cloud.project] }))
+      } else {
+        setStore((current) => {
+          const remaining = current.projects.filter((item) => item.id !== id)
+          const fallback = remaining[0] ?? makeProject('Moje první mapa', 'europe')
+          return { ...current, projects: remaining.length ? remaining : [fallback], activeProjectId: current.activeProjectId === id ? fallback.id : current.activeProjectId }
+        })
+      }
+    }
+    setSyncConflicts((current) => current.filter((item) => item.id !== id))
+    setSyncError(useRemote ? 'Načetla se novější cloudová verze.' : 'Lokální verze byla ponechána a bude znovu synchronizována.')
+    setSyncTick((value) => value + 1)
+  }
   const shareProject = async () => {
     try {
       const shareUrl = new URL(configuredPublicUrl || window.location.href)
-      shareUrl.hash = `shared=${encodeShare(project)}`
+      shareUrl.hash = `shared=${encodeSharedProject(project)}`
       const url = shareUrl.toString()
-      if (url.length > MAX_SHARE_URL_LENGTH) { setNotice('Projekt je příliš velký pro bezpečné sdílení v odkazu. Zmenši počet nebo geometrii objektů a zkus to znovu.'); return }
+      if (url.length > SHARE_URL_LIMIT) { setNotice('Geometrie tohoto projektu je příliš podrobná i po automatické optimalizaci pro sdílení. Prozatímní sdílení odkazem má limit 12 000 znaků.'); return }
       const localAddress = ['localhost', '127.0.0.1', '::1'].includes(shareUrl.hostname)
       const localWarning = localAddress ? ' Pozor: adresa localhost funguje pouze na tomto počítači. Pro sdílení na jiné zařízení aplikaci nasaď na veřejnou HTTPS adresu; můžeš ji nastavit jako VITE_PUBLIC_APP_URL.' : ''
       try { await navigator.clipboard.writeText(url); setNotice(`Odkaz na nezávislou kopii byl zkopírován.${localWarning}`) }
@@ -238,25 +576,18 @@ function App() {
   const searchPlaces = async (event: React.FormEvent) => {
     event.preventDefault()
     if (!query.trim()) return
-    setIsSearching(true); setCandidates([]); setNotice('')
-    const querySuffix: Partial<Record<PlaceType, string>> = { řeka: ' river', jezero: ' lake', pohoří: ' mountain range', stát: ' country' }
+    const requestId = ++searchRequestId.current
+    setIsSearching(true); setNotice('')
     try {
-      const searchQuery = `${query.trim()}${querySuffix[placeType] ?? ''}`
-      const response = await fetch(`https://nominatim.openstreetmap.org/search?format=jsonv2&polygon_geojson=1&extratags=1&limit=10&accept-language=cs&q=${encodeURIComponent(searchQuery)}`)
-      if (!response.ok) throw new Error('Search failed')
-      const result = await response.json() as SearchCandidate[]
-      const category: Partial<Record<PlaceType, string[]>> = { řeka: ['river', 'stream', 'waterway'], jezero: ['lake', 'reservoir', 'water'], pohoří: ['mountain_range', 'mountain'], stát: ['administrative', 'country'] }
-      const prioritized = [...result].sort((a, b) => {
-        const rank = (candidate: SearchCandidate) => (candidate.geojson && candidate.geojson.type !== 'Point' ? 2 : 0) + (category[placeType]?.some((value) => `${candidate.type} ${candidate.class}`.toLowerCase().includes(value)) ? 4 : 0)
-        return rank(b) - rank(a)
-      })
-      setCandidates(prioritized.slice(0, 7))
-      if (!result.length) setNotice('Místo se nepodařilo najít. Zkus upřesnit název.')
-    } catch { setNotice('Vyhledávání se nepodařilo dokončit. Zkontroluj připojení.') }
-    finally { setIsSearching(false) }
+      const results = await searchCandidates(query, placeType)
+      if (searchRequestId.current !== requestId) return
+      setCandidates(results)
+      if (!results.length) setNotice('Místo se nepodařilo najít. Zkus upřesnit název.')
+    } catch { if (searchRequestId.current === requestId) setNotice('Vyhledávání se nepodařilo dokončit. Zkontroluj připojení.') }
+    finally { if (searchRequestId.current === requestId) setIsSearching(false) }
   }
   const addCandidate = (candidate: SearchCandidate) => {
-    const name = candidate.name || candidate.display_name.split(',')[0]
+    const name = getCandidateName(candidate)
     const duplicate = project.features.some((feature) => feature.name.toLocaleLowerCase() === name.toLocaleLowerCase() || (Math.abs(feature.lat - Number(candidate.lat)) < .0001 && Math.abs(feature.lng - Number(candidate.lon)) < .0001))
     if (duplicate) { setNotice('Tento pojem už v projektu existuje.'); return }
     const geometry = candidate.geojson && candidate.geojson.type !== 'Point' ? candidate.geojson : undefined
@@ -292,9 +623,18 @@ function App() {
   const labelVisible = (feature: Feature) => mode === 'edit' || (mode === 'test' && (feedback === 'correct' || feedback === 'wrong') && (feature.id === target?.id || feature.id === selectedId))
 
   return <main className={`app-shell ${darkMode ? 'dark-theme' : ''}`}>
-    <header className="topbar"><div className="brand"><span className="brand-mark"><Compass size={18} /></span><span>atlas<span className="brand-accent">.</span>memo</span></div><div className="topbar-meta"><span className={`status-dot ${saveStatus === 'error' ? 'status-error' : ''}`} />{saveStatus === 'saving' ? 'Ukládám…' : saveStatus === 'error' ? 'Nepodařilo se uložit' : 'Uloženo'}<button className="avatar" aria-label="Profil uživatele">M</button></div></header>
+    <header className="topbar"><div className="brand"><span className="brand-mark"><Compass size={18} /></span><span>atlas<span className="brand-accent">.</span>memo</span></div><div className="topbar-meta"><span className={`status-dot ${saveStatus === 'error' ? 'status-error' : ''}`} />{saveStatus === 'saving' ? 'Ukládám…' : saveStatus === 'error' ? 'Nepodařilo se uložit' : 'Uloženo'}<span className={`auth-status ${authStatus === 'error' ? 'auth-error' : ''}`} title={authError || (firebaseUser ? `Firebase UID: ${firebaseUser.uid}` : undefined)}>{authStatus === 'checking' ? 'Ověřuji profil…' : authStatus === 'signing-in' ? 'Přihlašuji…' : authStatus === 'signing-out' ? 'Odhlašuji…' : authStatus === 'unconfigured' ? 'Firebase nenastaven' : authStatus === 'error' ? 'Chyba přihlášení' : firebaseUser ? <><span>{firebaseUser.email || firebaseUser.displayName || 'Přihlášeno'}</span><small>UID: {firebaseUser.uid}</small></> : 'Nepřihlášeno'}</span><button className="avatar" onClick={handleProfileAction} disabled={!isFirebaseConfigured || authStatus === 'checking' || authStatus === 'signing-in' || authStatus === 'signing-out'} aria-label={firebaseUser ? `Odhlásit účet ${firebaseUser.email || ''}, Firebase UID ${firebaseUser.uid}` : 'Přihlásit se přes Google'} title={authError || (authStatus === 'unconfigured' ? 'Nejdřív nastav VITE_FIREBASE_* v .env.local.' : firebaseUser ? `Odhlásit se · Firebase UID: ${firebaseUser.uid}` : 'Přihlásit se přes Google')}>{authStatus === 'signing-in' || authStatus === 'signing-out' ? '…' : firebaseUser ? (firebaseUser.displayName?.trim().charAt(0).toUpperCase() || firebaseUser.email?.charAt(0).toUpperCase() || 'U') : 'G'}</button></div></header>
     <div className="workspace">
-      <aside className="sidebar"><div className="sidebar-heading"><div><span className="eyebrow">MŮJ ATLAS</span><h1>Moje projekty</h1></div><button className="icon-button" onClick={() => setShowCreate(true)} aria-label="Nový projekt"><Plus size={18} /></button></div><div className="section-label">PROJEKTY</div><nav className="project-list">{store.projects.map((item) => <button key={item.id} className={`project-item ${item.id === project.id ? 'active' : ''}`} onClick={() => selectProject(item.id)}><span className="project-marker">{continentData[item.continent].short}</span><span className="project-name"><strong>{item.name}</strong><small>{continentData[item.continent].label} · {item.features.length} {item.features.length === 1 ? 'pojem' : 'pojmy'}</small></span>{item.id === project.id && <ChevronDown size={16} />}</button>)}</nav><div className="sidebar-note"><Sparkles size={16} /><div><strong>Uč se podle sebe</strong><span>Každý projekt má vlastní mapu a statistiky.</span></div></div><div className="sidebar-footer"><button className="theme-toggle" onClick={() => setDarkMode((value) => !value)}>{darkMode ? <Sun size={15} /> : <Moon size={15} />}{darkMode ? 'Světlý režim' : 'Tmavý režim'}</button><span className="saved-icon"><Check size={14} /></span><span>Automaticky ukládáme<br /><strong>v prohlížeči</strong></span></div></aside>
+      <aside className="sidebar"><div className="sidebar-heading"><div><span className="eyebrow">MŮJ ATLAS</span><h1>Moje projekty</h1></div><button className="icon-button" onClick={() => setShowCreate(true)} aria-label="Nový projekt"><Plus size={18} /></button></div><div className="section-label">PROJEKTY</div><nav className="project-list">{store.projects.map((item) => <button key={item.id} className={`project-item ${item.id === project.id ? 'active' : ''}`} onClick={() => selectProject(item.id)}><span className="project-marker">{continentData[item.continent].short}</span><span className="project-name"><strong>{item.name}</strong><small>{continentData[item.continent].label} · {item.features.length} {item.features.length === 1 ? 'pojem' : 'pojmy'}</small></span>{item.id === project.id && <ChevronDown size={16} />}</button>)}</nav>
+        <section className="sync-card" aria-live="polite">
+          <strong>{!firebaseUser ? 'Přihlaste se pro synchronizaci projektů.' : syncStatus === 'loading' ? 'Načítám cloudové projekty…' : syncStatus === 'syncing' ? 'Synchronizuji…' : syncStatus === 'error' ? 'Synchronizace má problém' : syncPrompt ? 'Vyberte, jak bezpečně pokračovat' : syncConflicts.length ? 'Vyřešte konflikty synchronizace' : syncStatus === 'ready' ? 'Synchronizováno' : 'Synchronizace pozastavena'}</strong>
+          {firebaseUser && syncPrompt === 'import' && <><span>Cloudový účet je prázdný. Místní projekty z tohoto prohlížeče lze importovat; před nahráním se uloží jejich přesná záloha.</span>{localMeasurement && <small>Naměřeno před importem: localStorage {formatByteSize(localMeasurement.localStoreBytes)}, geometrie {formatByteSize(localMeasurement.geometryBytes)}, největší tvar {formatByteSize(localMeasurement.largestGeometryBytes)}.</small>}<button onClick={importLocalProjects}>Zálohovat a importovat místní projekty</button></>}
+          {firebaseUser && syncPrompt === 'choose' && <><span>V cloudu je {cloudProjects.length} {cloudProjects.length === 1 ? 'projekt' : 'projektů'}. Místní data nebudou přepsána bez vaší volby.</span>{hasLocalData && localMeasurement && <small>Naměřeno před volbou: localStorage {formatByteSize(localMeasurement.localStoreBytes)}, geometrie {formatByteSize(localMeasurement.geometryBytes)}, největší tvar {formatByteSize(localMeasurement.largestGeometryBytes)}.</small>}<button onClick={useCloudProjects}>Zálohovat místní data a použít cloud</button><button className="sync-secondary" onClick={mergeLocalProjects} disabled={!hasLocalData}>Sloučit (ID existující v cloudu přeskočit)</button></>}
+          {syncConflicts.map((conflict) => <div className="sync-conflict" key={conflict.id}><span>{conflict.cloud ? `Projekt „${conflict.cloud.project.name}“ má novější cloudovou verzi.` : 'Projekt byl smazán z cloudu, ale místní verze obsahuje změny.'} Vyberte, kterou verzi ponechat.</span><div className="sync-actions"><button onClick={() => resolveCloudConflict(conflict.id, true)}>{conflict.cloud ? 'Načíst cloudovou verzi' : 'Potvrdit smazání'}</button><button className="sync-secondary" onClick={() => resolveCloudConflict(conflict.id, false)}>Ponechat a nahrát místní</button></div></div>)}
+          {syncError && <small className={syncStatus === 'error' ? 'sync-error' : 'sync-note'}>{syncError}</small>}
+          {firebaseUser && !syncPrompt && syncStatus === 'ready' && !syncConflicts.length && <span>Projekty tohoto účtu jsou synchronizované napříč zařízeními.</span>}
+        </section>
+        <div className="sidebar-note"><Sparkles size={16} /><div><strong>Uč se podle sebe</strong><span>Každý projekt má vlastní mapu a statistiky.</span></div></div><div className="sidebar-footer"><button className="theme-toggle" onClick={() => setDarkMode((value) => !value)}>{darkMode ? <Sun size={15} /> : <Moon size={15} />}{darkMode ? 'Světlý režim' : 'Tmavý režim'}</button><span className="saved-icon"><Check size={14} /></span><span>Automaticky ukládáme<br /><strong>v prohlížeči</strong></span></div></aside>
       <section className={`main-panel ${isFullscreen ? 'fullscreen-panel' : ''}`}><div className="content-header"><div><span className="eyebrow">PRACOVNÍ PROSTOR / {continent.label.toUpperCase()}</span><h2>{mode === 'edit' ? project.name : 'Najdi správné místo'}</h2><p>{mode === 'edit' ? 'Vytvoř si vlastní sbírku míst k procvičení.' : 'Klikni přímo na bod nebo objekt, který odpovídá zadání.'}</p></div><div className="header-actions"><button className="subtle-button" onClick={renameProject}><Pencil size={14} /> Přejmenovat</button><button className="subtle-button" onClick={shareProject}><Share2 size={14} /> Sdílet</button><button className="mode-button" onClick={deleteProject} aria-label="Smazat projekt"><Trash2 size={14} /></button><button className={`mode-button ${mode === 'edit' ? 'selected' : ''}`} onClick={() => { setMode('edit'); setFeedback('idle'); setSelectedId(null) }}><Pencil size={15} /> Upravit mapu</button><button className={`mode-button test ${mode === 'test' ? 'selected' : ''}`} onClick={startTest}><Target size={15} /> Testovat</button></div></div>
         {mode === 'test' && target && <div className={`quiz-banner ${feedback}`}><div className="quiz-label"><Target size={17} /><span>AKTUÁLNÍ ÚKOL</span></div><strong>Najdi: {target.name}</strong>{feedback === 'idle' && <span className="quiz-help">Objekty nemají popisky, dokud neodpovíš.</span>}{feedback === 'far' && <span className="feedback-text">Klikni na jeden z objektů na mapě.</span>}{feedback === 'correct' && <span className="feedback-text"><Check size={16} /> Správně!</span>}{feedback === 'wrong' && <span className="feedback-text">Špatně. Klikla jsi na „{project.features.find((feature) => feature.id === selectedId)?.name}“.</span>}{feedback !== 'idle' && feedback !== 'far' && <button onClick={nextQuestion} className="next-button">{project.testIndex + 1 >= project.testOrder.length ? 'Zobrazit shrnutí' : 'Další otázka'} <span>→</span></button>}</div>}
         {mode === 'test' && !target && <div className="quiz-banner complete"><strong>Test dokončen</strong><span>{stats.correct} / {stats.answered} správně · úspěšnost {stats.success} %</span><button onClick={startTest} className="next-button">Testovat znovu →</button></div>}
@@ -318,7 +658,9 @@ function App() {
           })}
         </MapViewport></MapContainer><div className="map-overlay"><span><span className="legend-dot" /> {project.features.length} {project.features.length === 1 ? 'pojem' : 'pojmy'} na mapě</span><span className="map-source"><MapPin size={13} />{project.mapLayer === 'blind' ? 'Hranice: Natural Earth' : '© OpenStreetMap contributors'}</span></div></div>
         <div className="display-mode-control" role="group" aria-label="Zobrazení objektů"><span>Zobrazení objektů</span><button className={project.displayMode === 'shape' ? 'active' : ''} onClick={() => handleDisplayMode('shape')}>Tvar</button><button className={project.displayMode === 'points' ? 'active' : ''} onClick={() => handleDisplayMode('points')}>Body</button></div>
-        {mode === 'edit' ? <div className="editor-grid"><div className="add-panel"><div className="panel-title"><span className="number-badge">01</span><div><h3>Přidej místo</h3><p>Vyhledej skutečné místo a vyber správný výsledek.</p></div></div><form onSubmit={searchPlaces} className="search-form"><div className="search-input"><Search size={17} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Vyhledat místo..." /><button type="button" aria-label="Vymazat hledání" onClick={() => { setQuery(''); setCandidates([]) }}><X size={15} /></button></div><div className="select-wrap"><select value={placeType} onChange={(event) => setPlaceType(event.target.value as PlaceType)}><option value="">Typ – volitelné</option><option>město</option><option>řeka</option><option>jezero</option><option>pohoří</option><option>stát</option><option>památka</option><option>jiný objekt</option></select><ChevronDown size={15} /></div><button className="add-button" disabled={isSearching}>{isSearching ? 'Hledám...' : <><Search size={16} /> Vyhledat</>}</button></form>{candidates.length > 0 && <div className="candidate-list">{candidates.map((candidate) => <button key={candidate.place_id} onClick={() => addCandidate(candidate)}><MapPin size={15} /><span><strong>{candidate.name || candidate.display_name.split(',')[0]}</strong><small>{candidate.display_name}</small></span><Plus size={15} /></button>)}</div>}{notice && <p className={`notice ${notice.includes('nepodařilo') || notice.includes('existuje') || notice.includes('příliš velký') ? 'error' : ''}`}>{notice}</p>}<p className="data-note"><Crosshair size={14} /> Hranice z dat Natural Earth · objekty ukládají dostupnou geometrii.</p></div><div className="places-panel"><div className="list-heading"><div><span className="section-label">TVOJE POJMY</span><strong>{project.features.length} {project.features.length === 1 ? 'položka' : 'položek'}</strong></div><button onClick={clearFeatures} className="clear-button">Vymazat vše</button></div><div className="place-list">{project.features.length === 0 ? <div className="empty-state">Projekt je zatím prázdný.<br />Vyhledej první místo výše.</div> : project.features.map((feature, index) => <div className={`place-row ${selectedId === feature.id ? 'selected-row' : ''}`} key={feature.id} onClick={() => setSelectedId(feature.id)}><span className="row-index">{String(index + 1).padStart(2, '0')}</span><span className="place-pin"><MapPin size={14} /></span><div className="place-copy"><strong>{feature.name}</strong><span>{feature.type || 'bez typu'} · {feature.lat.toFixed(2)}°, {feature.lng.toFixed(2)}°{feature.geometry ? ' · geometrie' : ''}</span></div><button className="edit-button" aria-label={`Upravit ${feature.name}`} onClick={(event) => { event.stopPropagation(); editFeature(feature) }}><Pencil size={14} /></button><button className="delete-button" aria-label={`Odstranit ${feature.name}`} onClick={(event) => { event.stopPropagation(); removeFeature(feature.id) }}><Trash2 size={15} /></button></div>)}</div></div></div> : <div className="stats-panel"><div><span className="section-label">STATISTIKY PROJEKTU</span><strong>{stats.total} pojmů</strong></div><div><strong>{stats.answered}</strong><span>zodpovězeno</span></div><div><strong>{stats.correct}</strong><span>správně</span></div><div><strong>{stats.wrong}</strong><span>špatně</span></div><div><strong>{stats.success} %</strong><span>úspěšnost</span></div></div>}
+        {mode === 'edit' ? <div className="editor-grid"><div className="add-panel"><div className="panel-title"><span className="number-badge">01</span><div><h3>Přidej místo</h3><p>Vyhledej skutečné místo a vyber správný výsledek.</p></div></div><form onSubmit={searchPlaces} className="search-form"><div className="search-input"><Search size={17} /><input value={query} onChange={(event) => { setQuery(event.target.value); setNotice('') }} placeholder="Vyhledat místo..." autoComplete="off" aria-label="Vyhledat místo" aria-expanded={candidates.length > 0} aria-controls="place-suggestions" /><button type="button" aria-label="Vymazat hledání" onClick={() => { setQuery(''); setCandidates([]); setNotice('') }}><X size={15} /></button></div><div className="select-wrap"><select value={placeType} onChange={(event) => setPlaceType(event.target.value as PlaceType)}><option value="">Typ – volitelné</option><option>město</option><option>řeka</option><option>jezero</option><option>pohoří</option><option>stát</option><option>památka</option><option>jiný objekt</option></select><ChevronDown size={15} /></div><button className="add-button" disabled={isSearching}>{isSearching ? 'Hledám...' : <><Search size={16} /> Vyhledat</>}</button></form>{isSearching && query.trim().length >= 2 && <p className="search-status">Hledám návrhy…</p>}{candidates.length > 0 && <div id="place-suggestions" className="candidate-list" role="listbox" aria-label="Návrhy míst">{candidates.map((candidate) => <button type="button" role="option" aria-selected="false" key={candidate.place_id} onClick={() => addCandidate(candidate)}><MapPin size={15} /><span><strong>{getCandidateName(candidate)}</strong><small>{candidate.display_name}</small></span><Plus size={15} /></button>)}</div>}
+        {notice && <p className={`notice ${notice.includes('nepodařilo') || notice.includes('existuje') || notice.includes('příliš velký') ? 'error' : ''}`}>{notice}</p>}
+        <p className="data-note"><Crosshair size={14} /> Hranice z dat Natural Earth · objekty ukládají dostupnou geometrii.</p></div><div className="places-panel"><div className="list-heading"><div><span className="section-label">TVOJE POJMY</span><strong>{project.features.length} {project.features.length === 1 ? 'položka' : 'položek'}</strong></div><button onClick={clearFeatures} className="clear-button">Vymazat vše</button></div><div className="place-list">{project.features.length === 0 ? <div className="empty-state">Projekt je zatím prázdný.<br />Vyhledej první místo výše.</div> : project.features.map((feature, index) => <div className={`place-row ${selectedId === feature.id ? 'selected-row' : ''}`} key={feature.id} onClick={() => setSelectedId(feature.id)}><span className="row-index">{String(index + 1).padStart(2, '0')}</span><span className="place-pin"><MapPin size={14} /></span><div className="place-copy"><strong>{feature.name}</strong><span>{feature.type || 'bez typu'} · {feature.lat.toFixed(2)}°, {feature.lng.toFixed(2)}°{feature.geometry ? ' · geometrie' : ''}</span></div><button className="edit-button" aria-label={`Upravit ${feature.name}`} onClick={(event) => { event.stopPropagation(); editFeature(feature) }}><Pencil size={14} /></button><button className="delete-button" aria-label={`Odstranit ${feature.name}`} onClick={(event) => { event.stopPropagation(); removeFeature(feature.id) }}><Trash2 size={15} /></button></div>)}</div></div></div> : <div className="stats-panel"><div><span className="section-label">STATISTIKY PROJEKTU</span><strong>{stats.total} pojmů</strong></div><div><strong>{stats.answered}</strong><span>zodpovězeno</span></div><div><strong>{stats.correct}</strong><span>správně</span></div><div><strong>{stats.wrong}</strong><span>špatně</span></div><div><strong>{stats.success} %</strong><span>úspěšnost</span></div></div>}
       </section>
     </div>
     {showCreate && <div className="modal-backdrop" onClick={() => setShowCreate(false)}><div className="modal" onClick={(event) => event.stopPropagation()}><div className="modal-heading"><div><span className="eyebrow">NOVÝ PROJEKT</span><h3>Vytvoř vlastní mapu</h3></div><button className="icon-button" onClick={() => setShowCreate(false)}><X size={16} /></button></div><label>Název projektu<input autoFocus value={newProjectName} onChange={(event) => setNewProjectName(event.target.value)} placeholder="Např. Řeky Evropy" /></label><label>Kontinent<select value={newProjectContinent} onChange={(event) => setNewProjectContinent(event.target.value as Continent)}>{(Object.keys(continentData) as Continent[]).map((key) => <option key={key} value={key}>{continentData[key].label}</option>)}</select></label><button className="add-button modal-submit" onClick={createProject}><Plus size={16} /> Vytvořit projekt</button></div></div>}

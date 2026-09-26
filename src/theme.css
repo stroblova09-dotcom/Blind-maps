@@ -53,6 +53,10 @@
 .sidebar-footer { flex-wrap: wrap; }
 .sidebar-footer .theme-toggle { width: 100%; margin: 0 0 15px; }
 .status-dot.status-error { background: #d85b45; }
+.auth-status { display: flex; flex-direction: column; align-items: flex-end; max-width: 260px; line-height: 1.25; }
+.auth-status small { color: var(--muted); font: 9px 'DM Mono', monospace; }
+.auth-status.auth-error { color: #c65d47; }
+.topbar-meta .avatar:disabled { cursor: wait; opacity: .7; }
 .feature-layer { cursor: pointer; }
 .leaflet-interactive { transition: stroke .12s ease, fill .12s ease, r .12s ease; }
 
@@ -113,6 +117,8 @@
   .map-layer-control { top: 10px; left: 10px; }
   .map-layer-control button { padding: 7px 8px; font-size: 10px; }
   .display-mode-control { margin-top: -12px; }
+  .auth-status { max-width: 112px; font-size: 9px; }
+  .auth-status small { font-size: 7px; }
 }
 
 @media (max-width: 900px) {
