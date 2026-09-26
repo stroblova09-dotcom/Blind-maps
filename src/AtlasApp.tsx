@@ -6,7 +6,7 @@ import type { Geometry as GeoJsonGeometry, GeoJsonObject, Position } from 'geojs
 import type { LeafletMouseEvent, LatLng, LatLngBoundsExpression, LatLngExpression, LatLngLiteral, Map as LeafletMap } from 'leaflet'
 import { isFirebaseConfigured } from './lib/firebaseConfig'
 import { normalizeProject, parseProjectStore, STORE_KEY } from './projectModel'
-import { backupLocalStore, measureLocalProjects, migrateLocalProjects } from './projectRepository'
+import { backupLocalStore, measureLocalProjects, migrateLocalProjects, ProjectImportError, FirestoreWriteError } from './projectRepository'
 import type { CloudProject, ProjectRepository } from './projectRepository'
 import type { Continent, Feature, PlaceType, Project, Store } from './projectModel'
 import { decodeSharedProject, encodeSharedProject, SHARE_URL_LIMIT } from './shareCodec'
@@ -22,6 +22,20 @@ type FirebaseAuthModule = typeof import('./lib/firebase')
 const THEME_KEY = 'atlas-memo-theme'
 const configuredPublicUrl = import.meta.env.VITE_PUBLIC_APP_URL?.trim()
 const formatByteSize = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(2)} MiB`
+const describeImportError = (error: unknown) => {
+  if (error instanceof ProjectImportError) {
+    if (error.stage === 'local backup') return `Zálohu se nepodařilo vytvořit ještě před přístupem k Firestore. Původní localStorage nebyl změněn. ${error.message}`
+    if (error.stage === 'Firestore read') return `Záloha je zachována, ale načtení seznamu z Firestore selhalo. ${error.message}`
+    if (error.cause instanceof FirestoreWriteError) {
+      const write = error.cause
+      if (write.code.includes('resource-exhausted')) return `Firestore odmítl zápis kvůli serverové kvótě při operaci „${write.stage}“ (${write.documentCount} dokumentových změn projektu „${error.projectName}“, kód ${write.code}). Záloha i localStorage jsou zachovány.`
+      if (write.code.includes('permission-denied')) return `Firestore Rules odmítla operaci „${write.stage}“ pro projekt „${error.projectName}“ (kód ${write.code}). Záloha i localStorage jsou zachovány.`
+      return `Zápis do Firestore selhal ve fázi „${write.stage}“ projektu „${error.projectName}“ (${write.documentCount} dokumentových změn, kód ${write.code}). Záloha i localStorage jsou zachovány. ${write.message}`
+    }
+    return `Zápis projektu „${error.projectName}“ do Firestore selhal. Záloha i localStorage jsou zachovány. ${error.message}`
+  }
+  return error instanceof Error ? error.message : 'Nepodařenou operaci se nepodařilo blíže určit.'
+}
 const localizedSearchAliases: Record<string, { query: string; name: string }> = {
   'floridský záliv': { query: 'Florida Bay', name: 'Floridský záliv' },
 }
@@ -229,6 +243,7 @@ function App() {
       if (cancelled) return
       firebaseAuthRef.current = firebase
       unsubscribe = firebase.observeFirebaseUser((user) => {
+        console.info('[Project sync] Auth state changed', { uid: user?.uid ?? null })
         setFirebaseUser(user)
         setAuthStatus(user ? 'signed-in' : 'signed-out')
         setAuthError('')
@@ -275,17 +290,21 @@ function App() {
     import('./lib/firebaseProjectStore').then(({ projectRepository }) => {
       if (cancelled) return
       repositoryRef.current = projectRepository
+      console.info('[Project sync] Starting project listener', { uid: firebaseUser.uid })
       unsubscribe = projectRepository.watchProjects(firebaseUser.uid, (remoteProjects) => {
         if (cancelled) return
+        console.info('[Project sync] Project listener received snapshot', { uid: firebaseUser.uid, count: remoteProjects.length, projectIds: remoteProjects.map(({ project: remoteProject }) => remoteProject.id) })
         const next = new Map(remoteProjects.map((item) => [item.project.id, item]))
         setCloudProjects(remoteProjects)
         if (!initialized) {
           initialized = true
           cloudBaselineRef.current = next
           if (remoteProjects.length) {
+            console.info('[Project sync] Initial cloud projects require an explicit local/cloud choice', { uid: firebaseUser.uid, localProjectCount: savedLocalStore?.projects.length ?? 0, cloudProjectCount: remoteProjects.length })
             setSyncPrompt('choose')
             setSyncStatus('choice')
           } else if (savedLocalStore) {
+            console.info('[Project sync] Cloud is empty; local projects require explicit import', { uid: firebaseUser.uid, localProjectCount: savedLocalStore.projects.length })
             setSyncPrompt('import')
             setSyncStatus('choice')
           } else {
@@ -336,6 +355,7 @@ function App() {
         setSyncStatus((current) => current === 'syncing' ? current : 'ready')
       }, (error) => {
         if (cancelled) return
+        console.error('[Project sync] Project listener failed', { uid: firebaseUser.uid, code: 'code' in error ? error.code : 'unknown' })
         setSyncError(error.message)
         setSyncStatus('error')
       })
@@ -359,12 +379,15 @@ function App() {
       hasPending = true
       savesInFlightRef.current.add(id)
       let savedSuccessfully = false
+      console.info('[Project sync] Saving project', { uid, projectId: id, expectedRevision: cloud?.revision ?? 0 })
       setSyncStatus('syncing')
       repository.saveProject(uid, projectToSave, cloud?.revision ?? 0).then((saved) => {
         savedSuccessfully = true
+        console.info('[Project sync] Project saved', { uid, projectId: id, revision: saved.revision })
         cloudBaselineRef.current.set(id, saved)
         setSyncError('')
       }).catch((error: unknown) => {
+        console.error('[Project sync] Project save failed', { uid, projectId: id, code: error && typeof error === 'object' && 'code' in error ? error.code : error instanceof Error ? error.name : 'unknown' })
         if (error instanceof Error && error.name === 'ProjectRevisionConflictError') {
           repository.listProjects(uid).then((latest) => {
             const newer = latest.find((item) => item.project.id === id)
@@ -435,7 +458,12 @@ function App() {
 
   const updateProject = (updater: (current: Project) => Project) => setStore((current) => ({ ...current, projects: current.projects.map((item) => item.id === project.id ? updater(item) : item) }))
   const selectProject = (id: string) => { setStore((current) => ({ ...current, activeProjectId: id })); setMode('edit'); setFeedback('idle'); setSelectedId(null); setHoveredId(null); setCandidates([]); setNotice('') }
-  const createProject = () => { const next = makeProject(newProjectName.trim() || 'Nová mapa', newProjectContinent); setStore((current) => ({ ...current, projects: [...current.projects, next], activeProjectId: next.id })); setNewProjectName(''); setShowCreate(false); setMode('edit'); setNotice('Nový projekt byl vytvořen.') }
+  const createProject = () => {
+    const next = makeProject(newProjectName.trim() || 'Nová mapa', newProjectContinent)
+    if (firebaseUser && !cloudReadyRef.current) console.info('[Project sync] New project is local-only until the pending import/merge choice is completed', { uid: firebaseUser.uid, projectId: next.id })
+    setStore((current) => ({ ...current, projects: [...current.projects, next], activeProjectId: next.id }))
+    setNewProjectName(''); setShowCreate(false); setMode('edit'); setNotice('Nový projekt byl vytvořen.')
+  }
   const renameProject = () => { const name = window.prompt('Nový název projektu:', project.name)?.trim(); if (name) updateProject((current) => ({ ...current, name })) }
   const deleteProject = () => {
     if (!window.confirm(`Opravdu smazat projekt „${project.name}“?`)) return
@@ -489,11 +517,11 @@ function App() {
     }
     return localRawStoreRef.current
   }
-  const useCloudProjects = () => {
+  const useCloudProjects = async () => {
     try {
       const rawLocalStore = refreshLocalStoreSnapshot()
       if (rawLocalStore) {
-        backupLocalStore(localStorage, firebaseUser?.uid ?? 'unknown', rawLocalStore)
+        await backupLocalStore(localStorage, firebaseUser?.uid ?? 'unknown', rawLocalStore)
       }
       const projects = cloudProjects.map((item) => item.project)
       const savedStore = parseProjectStore(rawLocalStore)
@@ -506,7 +534,7 @@ function App() {
       setSyncStatus('ready')
       setSyncError('')
     } catch (error) {
-      setSyncError(error instanceof Error ? error.message : 'Záložní kopii lokálních projektů se nepodařilo vytvořit.')
+      setSyncError(describeImportError(error))
       setSyncStatus('error')
     }
   }
@@ -527,7 +555,7 @@ function App() {
       setSyncStatus('ready')
       setSyncError(`Import dokončen: ${result.measurement.projectCount} projektů, ${result.measurement.featureCount} míst; localStorage ${formatByteSize(result.measurement.localStoreBytes)}, geometrie ${formatByteSize(result.measurement.geometryBytes)}, největší tvar ${formatByteSize(result.measurement.largestGeometryBytes)}. ${result.skippedCount ? `${result.skippedCount} kolidujících ID zůstalo beze změny. ` : ''}Záloha: ${result.backupKey}`)
     } catch (error) {
-      setSyncError(error instanceof Error ? error.message : 'Migrace selhala. Původní localStorage zůstalo zachováno; import lze bezpečně opakovat.')
+      setSyncError(describeImportError(error))
       setSyncStatus('error')
     }
   }
@@ -547,7 +575,7 @@ function App() {
       setSyncStatus('ready')
       setSyncError(`Sloučení hotovo (${result.migrated.length} přidáno, ${result.skippedCount} existujících ID ponecháno). Místní localStorage ${formatByteSize(result.measurement.localStoreBytes)}, geometrie ${formatByteSize(result.measurement.geometryBytes)}, největší tvar ${formatByteSize(result.measurement.largestGeometryBytes)}. Záloha: ${result.backupKey}`)
     } catch (error) {
-      setSyncError(error instanceof Error ? error.message : 'Sloučení selhalo. Cloudové ani lokální projekty nebyly smazány; lze bezpečně opakovat.')
+      setSyncError(describeImportError(error))
       setSyncStatus('error')
     }
   }

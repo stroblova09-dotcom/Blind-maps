@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { Feature, Project } from './projectModel'
-import { projectToFirestore, firestoreToProject, FIRESTORE_CHUNK_BYTES, joinGeometry, measureLocalProjects, migrateLocalProjects, ProjectRepository, ProjectRevisionConflictError, splitGeometry } from './projectRepository'
-import type { DocumentMutation, DocumentPath, ProjectRepositoryAdapter } from './projectRepository'
+import { backupLocalStore, projectToFirestore, firestoreToProject, FIRESTORE_CHUNK_BYTES, joinGeometry, measureLocalProjects, migrateLocalProjects, ProjectRepository, ProjectRevisionConflictError, ProjectImportError, FirestoreWriteError, splitGeometry } from './projectRepository'
+import type { CloudProject, DocumentMutation, DocumentPath, ProjectRepositoryAdapter } from './projectRepository'
 
 const sampleProject = (id = 'europe-project'): Project => ({
   id,
@@ -30,6 +30,7 @@ class MemoryAdapter implements ProjectRepositoryAdapter {
   readonly features = new Map<string, Record<string, unknown>>()
   readonly chunks = new Map<string, Record<string, unknown>>()
   shouldFail = false
+  failProjectMetadata = false
   listener: (() => void) | null = null
 
   private key(uid: string, path: DocumentPath) {
@@ -52,6 +53,7 @@ class MemoryAdapter implements ProjectRepositoryAdapter {
   }
   async commit(uid: string, mutations: DocumentMutation[]) {
     if (this.shouldFail) throw new Error('simulated write failure')
+    if (this.failProjectMetadata && mutations.some(({ path }) => path.collection === 'projects')) throw new Error('simulated metadata failure')
     for (const mutation of mutations) {
       const collection = mutation.path.collection === 'projects' ? this.projects : mutation.path.collection === 'features' ? this.features : this.chunks
       const key = this.key(uid, mutation.path)
@@ -131,6 +133,34 @@ describe('project Firestore repository', () => {
     expect(adapter.chunks.size).toBe(0)
   })
 
+  it('reports a failed project metadata commit separately from feature/geometry batches', async () => {
+    const adapter = new MemoryAdapter()
+    adapter.failProjectMetadata = true
+    const repository = new ProjectRepository(adapter)
+
+    await expect(repository.saveProject('uid-1', sampleProject(), 0)).rejects.toMatchObject({
+      name: 'FirestoreWriteError',
+      stage: 'project metadata',
+      documentCount: 1,
+    } satisfies Partial<FirestoreWriteError>)
+  })
+
+  it('delivers realtime project changes only through the requested user UID', async () => {
+    const adapter = new MemoryAdapter()
+    const repository = new ProjectRepository(adapter)
+    let unsubscribe: () => void = () => {}
+    const receivedSnapshot = new Promise<CloudProject[]>((resolve, reject) => {
+      unsubscribe = repository.watchProjects('uid-device-b', resolve, reject)
+    })
+
+    await repository.saveProject('uid-device-b', sampleProject(), 0)
+    const projects = await receivedSnapshot
+    unsubscribe()
+
+    expect(projects.map(({ project }) => project.id)).toEqual(['europe-project'])
+    expect(await repository.listProjects('uid-device-a')).toEqual([])
+  })
+
   it('backs up and migrates local projects, skipping cloud ID collisions without overwriting', async () => {
     const adapter = new MemoryAdapter()
     const repository = new ProjectRepository(adapter, () => 200)
@@ -150,6 +180,27 @@ describe('project Firestore repository', () => {
     expect(restored.map(({ project }) => project.id)).toContain('asia-project')
   })
 
+  it('uses IndexedDB backup fallback when duplicating the local backup exceeds localStorage quota', async () => {
+    const raw = JSON.stringify({ version: 2, projects: [sampleProject()] })
+    const writes: string[] = []
+    let fallbackCalled = false
+    const storage = {
+      getItem: () => null,
+      setItem: (key: string) => { writes.push(key); throw new DOMException('The quota has been exceeded.', 'QuotaExceededError') },
+    }
+
+    const backup = await backupLocalStore(storage, 'uid-1', raw, async (uid, preservedRaw) => {
+      fallbackCalled = true
+      expect(uid).toBe('uid-1')
+      expect(preservedRaw).toBe(raw)
+      return 'IndexedDB: atlas-memo-backups/projectStores/uid-1'
+    })
+
+    expect(fallbackCalled).toBe(true)
+    expect(writes).toHaveLength(1)
+    expect(backup).toContain('IndexedDB')
+  })
+
   it('retains the original localStorage and its backup if any migration write fails', async () => {
     const adapter = new MemoryAdapter()
     const repository = new ProjectRepository(adapter)
@@ -158,7 +209,15 @@ describe('project Firestore repository', () => {
     storage.setItem('atlas-memo-projects-v2', raw)
     adapter.shouldFail = true
 
-    await expect(migrateLocalProjects(repository, 'uid-1', storage, raw)).rejects.toThrow('simulated write failure')
+    await expect(migrateLocalProjects(repository, 'uid-1', storage, raw)).rejects.toMatchObject({
+      name: 'ProjectImportError',
+      stage: 'Firestore project write',
+      cause: expect.objectContaining({
+        name: 'FirestoreWriteError',
+        stage: 'features/geometryChunks batch',
+        documentCount: 1,
+      }),
+    } satisfies Partial<ProjectImportError> & { cause: Partial<FirestoreWriteError> })
     expect(storage.getItem('atlas-memo-projects-v2')).toBe(raw)
     expect([...storage.data.keys()].some((key) => key.startsWith('atlas-memo-projects-v2.backup.'))).toBe(true)
   })

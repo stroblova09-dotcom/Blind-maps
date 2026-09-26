@@ -40,6 +40,42 @@ export class ProjectRevisionConflictError extends Error {
   }
 }
 
+export type FirestoreWriteStage = 'features/geometryChunks batch' | 'project metadata' | 'project delete batch'
+
+export class FirestoreWriteError extends Error {
+  readonly stage: FirestoreWriteStage
+  readonly projectId: string
+  readonly documentCount: number
+  readonly code: string
+
+  constructor(stage: FirestoreWriteStage, projectId: string, documentCount: number, cause: unknown) {
+    const code = cause && typeof cause === 'object' && 'code' in cause ? String(cause.code) : 'unknown'
+    const detail = cause instanceof Error ? cause.message : String(cause)
+    super(`Firestore ${stage} failed for project ${projectId} (${documentCount} document mutations, ${code}): ${detail}`, { cause })
+    this.name = 'FirestoreWriteError'
+    this.stage = stage
+    this.projectId = projectId
+    this.documentCount = documentCount
+    this.code = code
+  }
+}
+
+export class ProjectImportError extends Error {
+  readonly stage: 'local backup' | 'Firestore read' | 'Firestore project write'
+  readonly projectName?: string
+  readonly code: string
+
+  constructor(stage: ProjectImportError['stage'], cause: unknown, projectName?: string) {
+    const code = cause && typeof cause === 'object' && 'code' in cause ? String(cause.code) : cause instanceof Error ? cause.name : 'unknown'
+    const detail = cause instanceof Error ? cause.message : String(cause)
+    super(`${stage}${projectName ? ` (${projectName})` : ''}: ${detail}`, { cause })
+    this.name = 'ProjectImportError'
+    this.stage = stage
+    this.projectName = projectName
+    this.code = code
+  }
+}
+
 const byteLength = (value: string) => new TextEncoder().encode(value).length
 const bytesToBase64 = (bytes: Uint8Array) => {
   let binary = ''
@@ -221,8 +257,17 @@ export class ProjectRepository {
     }
 
     const metadata = projectToFirestore(project, revision, createdAt, updatedAt, changeId)
-    await this.commitInBatches(uid, mutations)
-    await this.adapter.commit(uid, [{ path: { collection: 'projects', projectId: project.id }, data: { ...metadata, id: project.id } }])
+    try {
+      await this.commitInBatches(uid, mutations, project.id, 'features/geometryChunks batch')
+    } catch (error) {
+      if (error instanceof FirestoreWriteError) throw error
+      throw new FirestoreWriteError('features/geometryChunks batch', project.id, mutations.length, error)
+    }
+    try {
+      await this.adapter.commit(uid, [{ path: { collection: 'projects', projectId: project.id }, data: { ...metadata, id: project.id } }])
+    } catch (error) {
+      throw new FirestoreWriteError('project metadata', project.id, 1, error)
+    }
     return { project: structuredClone(project), revision, changeId, createdAt, updatedAt }
   }
 
@@ -236,23 +281,68 @@ export class ProjectRepository {
       mutations.push({ path: { collection: 'features', projectId, featureId: feature.id }, data: null })
     }
     mutations.push({ path: { collection: 'projects', projectId }, data: null })
-    await this.commitInBatches(uid, mutations)
+    await this.commitInBatches(uid, mutations, projectId, 'project delete batch')
   }
 
-  private async commitInBatches(uid: string, mutations: DocumentMutation[]) {
+  private async commitInBatches(uid: string, mutations: DocumentMutation[], projectId: string, stage: FirestoreWriteStage) {
     for (let offset = 0; offset < mutations.length; offset += 400) {
-      await this.adapter.commit(uid, mutations.slice(offset, offset + 400))
+      const batch = mutations.slice(offset, offset + 400)
+      try {
+        await this.adapter.commit(uid, batch)
+      } catch (error) {
+        throw new FirestoreWriteError(stage, projectId, batch.length, error)
+      }
     }
   }
 }
 
 export type LocalStorageLike = Pick<Storage, 'getItem' | 'setItem'>
-export const localBackupKey = (uid: string, timestamp: number) => `atlas-memo-projects-v2.backup.${encodeURIComponent(uid)}.${timestamp}`
+export const localBackupKey = (uid: string) => `atlas-memo-projects-v2.backup.${encodeURIComponent(uid)}`
 
-export const backupLocalStore = (storage: LocalStorageLike, uid: string, rawStore: string, timestamp = Date.now()) => {
-  const key = localBackupKey(uid, timestamp)
-  storage.setItem(key, rawStore)
-  return key
+const indexedDbBackup = (uid: string, rawStore: string): Promise<string> => new Promise((resolve, reject) => {
+  if (!globalThis.indexedDB) {
+    reject(new Error('IndexedDB není dostupné pro bezpečnou zálohu.'))
+    return
+  }
+  const request = indexedDB.open('atlas-memo-backups', 1)
+  request.onupgradeneeded = () => {
+    const db = request.result
+    if (!db.objectStoreNames.contains('projectStores')) db.createObjectStore('projectStores', { keyPath: 'uid' })
+  }
+  request.onerror = () => reject(request.error ?? new Error('IndexedDB backup database could not be opened.'))
+  request.onsuccess = () => {
+    const db = request.result
+    const transaction = db.transaction('projectStores', 'readwrite')
+    transaction.objectStore('projectStores').put({ uid, rawStore, savedAt: Date.now() })
+    transaction.oncomplete = () => { db.close(); resolve(`IndexedDB: atlas-memo-backups/projectStores/${encodeURIComponent(uid)}`) }
+    transaction.onerror = () => { db.close(); reject(transaction.error ?? new Error('IndexedDB backup transaction failed.')) }
+    transaction.onabort = () => { db.close(); reject(transaction.error ?? new Error('IndexedDB backup transaction was aborted.')) }
+  }
+})
+
+const isQuotaExceeded = (error: unknown) => error instanceof DOMException
+  ? error.name === 'QuotaExceededError' || error.code === 22 || error.code === 1014
+  : Boolean(error && typeof error === 'object' && 'code' in error && (error.code === 22 || error.code === 1014))
+
+export const backupLocalStore = async (
+  storage: LocalStorageLike,
+  uid: string,
+  rawStore: string,
+  fallback: (uid: string, rawStore: string) => Promise<string> = indexedDbBackup,
+) => {
+  const key = localBackupKey(uid)
+  try {
+    if (storage.getItem(key) !== rawStore) storage.setItem(key, rawStore)
+    return key
+  } catch (error) {
+    if (!isQuotaExceeded(error)) throw new ProjectImportError('local backup', error)
+    try {
+      return await fallback(uid, rawStore)
+    } catch (backupError) {
+      const detail = backupError instanceof Error ? backupError.message : String(backupError)
+      throw new ProjectImportError('local backup', new Error(`localStorage quota exceeded; IndexedDB backup also failed: ${detail}`, { cause: backupError }))
+    }
+  }
 }
 
 export const measureLocalProjects = (rawStore: string, projects: Project[]) => {
@@ -274,14 +364,28 @@ export const migrateLocalProjects = async (
 ) => {
   const parsed = JSON.parse(rawStore) as { version?: number; projects?: Project[] }
   if (parsed.version !== 2 || !Array.isArray(parsed.projects) || !parsed.projects.length) throw new Error('Lokální projekty se nepodařilo bezpečně načíst.')
-  const backupKey = backupLocalStore(storage, uid, rawStore)
+  let backupKey: string
+  try {
+    backupKey = await backupLocalStore(storage, uid, rawStore)
+  } catch (error) {
+    throw error instanceof ProjectImportError ? error : new ProjectImportError('local backup', error)
+  }
   const measurement = measureLocalProjects(rawStore, parsed.projects)
-  const existing = await repository.listProjects(uid)
+  let existing: CloudProject[]
+  try {
+    existing = await repository.listProjects(uid)
+  } catch (error) {
+    throw new ProjectImportError('Firestore read', error)
+  }
   const existingIds = new Set(existing.map(({ project }) => project.id))
   const migrated: CloudProject[] = []
   for (const sourceProject of parsed.projects) {
     if (existingIds.has(sourceProject.id)) continue
-    migrated.push(await repository.saveProject(uid, sourceProject, 0))
+    try {
+      migrated.push(await repository.saveProject(uid, sourceProject, 0))
+    } catch (error) {
+      throw new ProjectImportError('Firestore project write', error, sourceProject.name)
+    }
   }
   return { backupKey, migrated, skippedCount: parsed.projects.length - migrated.length, measurement }
 }
