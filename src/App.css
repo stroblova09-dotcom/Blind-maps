@@ -22,5 +22,7 @@
 .sync-conflict { display:grid; gap:8px; padding-top:8px; border-top:1px solid var(--line); }
 .sync-error { color:#bd5643; overflow-wrap:anywhere; }
 .sync-note { color:#4e9270; overflow-wrap:anywhere; }
+.auth-error-banner { display:flex; align-items:center; justify-content:space-between; gap:14px; padding:10px 20px; background:#fff0eb; border-bottom:1px solid #f1c8bb; color:#9b3d2c; font-size:12px; line-height:1.45; }
+.auth-error-banner button { flex:none; border:0; background:transparent; color:inherit; font-size:20px; line-height:1; }
 .dark-theme .sync-card { background:rgba(20,43,39,.76); }
 .dark-theme .sync-card button.sync-secondary { background:#203c35; color:#dceee7; border-color:#38574e; }

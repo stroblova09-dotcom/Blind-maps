@@ -17,6 +17,7 @@ type SearchCandidate = { place_id: string; display_name: string; name?: string; 
 type HitEvent = { latlng: LatLng; containerPoint: { x: number; y: number }; map: LeafletMap }
 type AuthStatus = 'checking' | 'signed-out' | 'signing-in' | 'signing-out' | 'signed-in' | 'unconfigured' | 'error'
 type SyncConflict = { id: string; cloud: CloudProject | null }
+type FirebaseAuthModule = typeof import('./lib/firebase')
 
 const THEME_KEY = 'atlas-memo-theme'
 const configuredPublicUrl = import.meta.env.VITE_PUBLIC_APP_URL?.trim()
@@ -200,6 +201,7 @@ function App() {
   const savesInFlightRef = useRef(new Set<string>())
   const localRawStoreRef = useRef<string | null>(null)
   const repositoryRef = useRef<ProjectRepository | null>(null)
+  const firebaseAuthRef = useRef<FirebaseAuthModule | null>(null)
   const project = store.projects.find((item) => item.id === store.activeProjectId) ?? store.projects[0]
   const continent = continentData[project.continent]
   const target = project.features.find((feature) => feature.id === project.testOrder[project.testIndex])
@@ -223,23 +225,27 @@ function App() {
     if (!isFirebaseConfigured) return
     let cancelled = false
     let unsubscribe: (() => void) | undefined
-    import('./lib/firebase').then(({ observeFirebaseUser }) => {
+    import('./lib/firebase').then((firebase) => {
       if (cancelled) return
-      unsubscribe = observeFirebaseUser((user) => {
+      firebaseAuthRef.current = firebase
+      unsubscribe = firebase.observeFirebaseUser((user) => {
         setFirebaseUser(user)
         setAuthStatus(user ? 'signed-in' : 'signed-out')
         setAuthError('')
       }, (error) => {
+        console.error('[Firebase Auth] Auth state listener failed', { message: error.message })
         setFirebaseUser(null)
         setAuthStatus('error')
-        setAuthError(error.message)
+        setAuthError(`Stav přihlášení se nepodařilo ověřit: ${error.message}`)
       })
     }).catch((error: unknown) => {
       if (cancelled) return
+      const message = error instanceof Error ? error.message : String(error)
+      console.error('[Firebase Auth] Firebase Auth module failed to load', { message })
       setAuthStatus('error')
-      setAuthError(error instanceof Error ? error.message : 'Firebase Auth se nepodařilo načíst.')
+      setAuthError(`Firebase přihlášení se nepodařilo načíst: ${message}`)
     })
-    return () => { cancelled = true; unsubscribe?.() }
+    return () => { cancelled = true; unsubscribe?.(); firebaseAuthRef.current = null }
   }, [])
   useEffect(() => {
     if (!firebaseUser) {
@@ -443,7 +449,8 @@ function App() {
     }
     setAuthError('')
     try {
-      const firebase = await import('./lib/firebase')
+      const firebase = firebaseAuthRef.current
+      if (!firebase) throw new Error('Firebase Auth ještě není připraven. Obnov stránku a zkus to znovu.')
       if (firebaseUser) {
         setAuthStatus('signing-out')
         await firebase.signOutFirebaseUser()
@@ -453,14 +460,20 @@ function App() {
       }
     } catch (error) {
       const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : ''
+      const errorMessage = error instanceof Error ? error.message : String(error)
+      console.error('[Firebase Auth] Google authentication action failed', { code: code || 'unknown', message: errorMessage })
       setAuthStatus(firebaseUser ? 'signed-in' : 'signed-out')
       const message = code === 'auth/popup-closed-by-user'
         ? 'Přihlašovací okno bylo zavřeno.'
         : code === 'auth/popup-blocked'
           ? 'Prohlížeč zablokoval přihlašovací okno. Povol vyskakovací okna pro tento web a zkus to znovu.'
+          : code === 'auth/operation-not-allowed'
+            ? 'Přihlášení přes Google není pro tento Firebase projekt povolené.'
           : code === 'auth/unauthorized-domain'
             ? 'Tato doména není autorizována ve Firebase Console.'
-            : error instanceof Error ? error.message : 'Přihlášení se nepodařilo.'
+            : code === 'auth/network-request-failed'
+              ? 'Přihlášení se nepodařilo kvůli síťové chybě. Zkontroluj připojení a zkus to znovu.'
+              : errorMessage || 'Přihlášení se nepodařilo.'
       setAuthError(message)
     }
   }
@@ -624,6 +637,7 @@ function App() {
 
   return <main className={`app-shell ${darkMode ? 'dark-theme' : ''}`}>
     <header className="topbar"><div className="brand"><span className="brand-mark"><Compass size={18} /></span><span>atlas<span className="brand-accent">.</span>memo</span></div><div className="topbar-meta"><span className={`status-dot ${saveStatus === 'error' ? 'status-error' : ''}`} />{saveStatus === 'saving' ? 'Ukládám…' : saveStatus === 'error' ? 'Nepodařilo se uložit' : 'Uloženo'}<span className={`auth-status ${authStatus === 'error' ? 'auth-error' : ''}`} title={authError || (firebaseUser ? `Firebase UID: ${firebaseUser.uid}` : undefined)}>{authStatus === 'checking' ? 'Ověřuji profil…' : authStatus === 'signing-in' ? 'Přihlašuji…' : authStatus === 'signing-out' ? 'Odhlašuji…' : authStatus === 'unconfigured' ? 'Firebase nenastaven' : authStatus === 'error' ? 'Chyba přihlášení' : firebaseUser ? <><span>{firebaseUser.email || firebaseUser.displayName || 'Přihlášeno'}</span><small>UID: {firebaseUser.uid}</small></> : 'Nepřihlášeno'}</span><button className="avatar" onClick={handleProfileAction} disabled={!isFirebaseConfigured || authStatus === 'checking' || authStatus === 'signing-in' || authStatus === 'signing-out'} aria-label={firebaseUser ? `Odhlásit účet ${firebaseUser.email || ''}, Firebase UID ${firebaseUser.uid}` : 'Přihlásit se přes Google'} title={authError || (authStatus === 'unconfigured' ? 'Nejdřív nastav VITE_FIREBASE_* v .env.local.' : firebaseUser ? `Odhlásit se · Firebase UID: ${firebaseUser.uid}` : 'Přihlásit se přes Google')}>{authStatus === 'signing-in' || authStatus === 'signing-out' ? '…' : firebaseUser ? (firebaseUser.displayName?.trim().charAt(0).toUpperCase() || firebaseUser.email?.charAt(0).toUpperCase() || 'U') : 'G'}</button></div></header>
+    {authError && <div className="auth-error-banner" role="alert" aria-live="assertive"><span>{authError}</span><button type="button" onClick={() => setAuthError('')} aria-label="Zavřít chybové upozornění">×</button></div>}
     <div className="workspace">
       <aside className="sidebar"><div className="sidebar-heading"><div><span className="eyebrow">MŮJ ATLAS</span><h1>Moje projekty</h1></div><button className="icon-button" onClick={() => setShowCreate(true)} aria-label="Nový projekt"><Plus size={18} /></button></div><div className="section-label">PROJEKTY</div><nav className="project-list">{store.projects.map((item) => <button key={item.id} className={`project-item ${item.id === project.id ? 'active' : ''}`} onClick={() => selectProject(item.id)}><span className="project-marker">{continentData[item.continent].short}</span><span className="project-name"><strong>{item.name}</strong><small>{continentData[item.continent].label} · {item.features.length} {item.features.length === 1 ? 'pojem' : 'pojmy'}</small></span>{item.id === project.id && <ChevronDown size={16} />}</button>)}</nav>
         <section className="sync-card" aria-live="polite">
