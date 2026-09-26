@@ -1,14 +1,16 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import { CircleMarker, GeoJSON, MapContainer, Polygon, Polyline, TileLayer, Tooltip, useMap, useMapEvents } from 'react-leaflet'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { GeoJSON, MapContainer, TileLayer, useMap, useMapEvents } from 'react-leaflet'
 import { Check, ChevronDown, Compass, Crosshair, Expand, MapPin, Moon, Pencil, Plus, Search, Share2, Sparkles, Sun, Target, Trash2, X } from 'lucide-react'
 import type { User } from 'firebase/auth'
 import type { Geometry as GeoJsonGeometry, GeoJsonObject, Position } from 'geojson'
-import type { LeafletMouseEvent, LatLng, LatLngBoundsExpression, LatLngExpression, LatLngLiteral, Map as LeafletMap } from 'leaflet'
+import type { LeafletMouseEvent, LatLng, LatLngBoundsExpression, LatLngLiteral, Map as LeafletMap } from 'leaflet'
 import { isFirebaseConfigured } from './lib/firebaseConfig'
 import { normalizeProject, parseProjectStore, STORE_KEY } from './projectModel'
 import { backupLocalStore, measureLocalProjects, migrateLocalProjects, ProjectImportError, FirestoreWriteError } from './projectRepository'
 import type { CloudProject, ProjectRepository } from './projectRepository'
 import type { Continent, Feature, PlaceType, Project, Store } from './projectModel'
+import { FeatureMapItem } from './FeatureMapItem'
+import { ProjectPlaceRow } from './ProjectPlaceRow'
 import { decodeSharedProject, encodeSharedProject, SHARE_URL_LIMIT } from './shareCodec'
 import './App.css'
 import './theme.css'
@@ -105,7 +107,6 @@ const loadStore = (): Store => {
   return initial
 }
 
-const coordsToLatLng = (positions: Position[]): LatLngExpression[] => positions.map(([lng, lat]) => [lat, lng] as LatLngExpression)
 const mapPosition = (position: Position, map: LeafletMap) => map.latLngToContainerPoint([position[1], position[0]])
 const segmentDistance = (point: { x: number; y: number }, start: { x: number; y: number }, end: { x: number; y: number }) => {
   const dx = end.x - start.x, dy = end.y - start.y
@@ -165,17 +166,6 @@ function MapViewport({ children, resetView, viewKey, mapLayer, isFullscreen, onM
     return () => cancelAnimationFrame(frame)
   }, [map, resetLat, resetLng, resetZoom, viewKey, mapLayer, isFullscreen])
   return <><div className="map-controls"><button onClick={() => map.zoomIn()} aria-label="Přiblížit">+</button><button onClick={() => map.zoomOut()} aria-label="Oddálit">−</button><button onClick={() => map.setView(resetView.center, resetView.zoom)} aria-label="Zobrazit celý kontinent"><Crosshair size={15} /></button><button onClick={onFullscreen} aria-label="Celá obrazovka"><Expand size={15} /></button></div>{children}</>
-}
-
-function GeometryLayer({ feature, color, fillColor, tooltip, permanentTooltip, onSelect, onHover }: { feature: Feature; color: string; fillColor: string; tooltip: boolean; permanentTooltip: boolean; onSelect: (event: LeafletMouseEvent) => void; onHover: (active: boolean) => void }) {
-  const geometry = feature.geometry
-  const handlers = { click: onSelect, mouseover: () => onHover(true), mouseout: () => onHover(false) }
-  if (!geometry || geometry.type === 'Point') return null
-  if (geometry.type === 'LineString') return <Polyline positions={coordsToLatLng(geometry.coordinates)} pathOptions={{ color, weight: 4, opacity: .9 }} eventHandlers={handlers}>{tooltip && <Tooltip sticky permanent={permanentTooltip}>{feature.name}</Tooltip>}</Polyline>
-  if (geometry.type === 'MultiLineString') return <>{geometry.coordinates.map((line, index) => <Polyline key={index} positions={coordsToLatLng(line)} pathOptions={{ color, weight: 4, opacity: .9 }} eventHandlers={handlers}>{tooltip && <Tooltip sticky permanent={permanentTooltip}>{feature.name}</Tooltip>}</Polyline>)}</>
-  if (geometry.type === 'Polygon') return <Polygon positions={geometry.coordinates.map(coordsToLatLng)} pathOptions={{ color, fillColor, fillOpacity: .24, weight: 2 }} eventHandlers={handlers}>{tooltip && <Tooltip sticky permanent={permanentTooltip}>{feature.name}</Tooltip>}</Polygon>
-  if (geometry.type === 'MultiPolygon') return <>{geometry.coordinates.map((polygon, index) => <Polygon key={index} positions={polygon.map(coordsToLatLng)} pathOptions={{ color, fillColor, fillOpacity: .24, weight: 2 }} eventHandlers={handlers}>{tooltip && <Tooltip sticky permanent={permanentTooltip}>{feature.name}</Tooltip>}</Polygon>)}</>
-  return null
 }
 
 function App() {
@@ -457,7 +447,9 @@ function App() {
     return () => { window.clearTimeout(timer); controller.abort() }
   }, [query, placeType, mode])
 
-  const updateProject = (updater: (current: Project) => Project) => setStore((current) => ({ ...current, projects: current.projects.map((item) => item.id === project.id ? updater(item) : item) }))
+  const updateProject = useCallback((updater: (current: Project) => Project) => setStore((current) => ({ ...current, projects: current.projects.map((item) => item.id === project.id ? updater(item) : item) })), [project.id])
+  const setFeatureHovered = useCallback((featureId: string, active: boolean) => setHoveredId((current) => active ? featureId : current === featureId ? null : current), [])
+  const selectPlaceRow = useCallback((id: string) => setSelectedId(id), [])
   const selectProject = (id: string) => { setStore((current) => ({ ...current, activeProjectId: id })); setMode('edit'); setFeedback('idle'); setSelectedId(null); setHoveredId(null); setCandidates([]); setNotice('') }
   const createProject = () => {
     const next = makeProject(newProjectName.trim() || 'Nová mapa', newProjectContinent)
@@ -636,23 +628,23 @@ function App() {
     const feature: Feature = { id: crypto.randomUUID(), name, type: placeType, lat: Number(candidate.lat), lng: Number(candidate.lon), displayName: candidate.display_name, geometry }
     updateProject((current) => ({ ...current, features: [...current.features, feature] })); setCandidates([]); setQuery(''); setNotice(geometry ? 'Místo i jeho geometrie byly přidány.' : 'Místo bylo přidáno jako bod; geometrie nebyla dostupná.')
   }
-  const editFeature = (feature: Feature) => { const name = window.prompt('Název pojmu:', feature.name)?.trim(); if (!name || name === feature.name) return; updateProject((current) => ({ ...current, features: current.features.map((item) => item.id === feature.id ? { ...item, name } : item) })) }
-  const removeFeature = (id: string) => updateProject((current) => ({ ...current, features: current.features.filter((feature) => feature.id !== id), testOrder: current.testOrder.filter((item) => item !== id), testIndex: 0 }))
+  const editFeature = useCallback((feature: Feature) => { const name = window.prompt('Název pojmu:', feature.name)?.trim(); if (!name || name === feature.name) return; updateProject((current) => ({ ...current, features: current.features.map((item) => item.id === feature.id ? { ...item, name } : item) })) }, [updateProject])
+  const removeFeature = useCallback((id: string) => updateProject((current) => ({ ...current, features: current.features.filter((feature) => feature.id !== id), testOrder: current.testOrder.filter((item) => item !== id), testIndex: 0 })), [updateProject])
   const clearFeatures = () => { if (window.confirm('Opravdu vymazat všechny pojmy v tomto projektu?')) updateProject((current) => ({ ...current, features: [], testOrder: [], testIndex: 0 })) }
   const startTest = () => { if (!project.features.length) { setNotice('Nejdřív přidej alespoň jeden pojem.'); return } const order = [...project.features].sort(() => Math.random() - .5).map((feature) => feature.id); updateProject((current) => ({ ...current, testOrder: order, testIndex: 0, stats: { answered: 0, correct: 0, wrong: 0 } })); setMode('test'); setFeedback('idle'); setSelectedId(null); setHoveredId(null) }
   const nextQuestion = () => { updateProject((current) => ({ ...current, testIndex: current.testIndex + 1 })); setFeedback('idle'); setSelectedId(null); setHoveredId(null) }
-  const evaluateFeature = (feature: Feature) => {
+  const evaluateFeature = useCallback((feature: Feature) => {
     if (mode !== 'test' || (feedback !== 'idle' && feedback !== 'far') || !target) return
     setSelectedId(feature.id)
     const correct = feature.id === target.id
     setFeedback(correct ? 'correct' : 'wrong')
     updateProject((current) => ({ ...current, stats: { answered: current.stats.answered + 1, correct: current.stats.correct + (correct ? 1 : 0), wrong: current.stats.wrong + (correct ? 0 : 1) } }))
-  }
-  const selectFeature = (feature: Feature, event: LeafletMouseEvent) => {
+  }, [feedback, mode, target, updateProject])
+  const selectFeature = useCallback((feature: Feature, event: LeafletMouseEvent) => {
     event.originalEvent.stopPropagation()
     if (mode === 'edit') setSelectedId(feature.id)
     else evaluateFeature(feature)
-  }
+  }, [evaluateFeature, mode])
   const answer = (event: HitEvent) => {
     if (mode !== 'test' || (feedback !== 'idle' && feedback !== 'far') || !target) return
     const nearest = project.features.map((feature) => ({ feature, distance: featureHitDistance(feature, event) })).sort((a, b) => a.distance - b.distance)[0]
@@ -662,7 +654,6 @@ function App() {
   const handleFullscreen = () => setIsFullscreen((value) => !value)
   const handleLayer = (layer: Project['mapLayer']) => updateProject((current) => ({ ...current, mapLayer: layer }))
   const handleDisplayMode = (displayMode: Project['displayMode']) => updateProject((current) => ({ ...current, displayMode }))
-  const labelVisible = (feature: Feature) => mode === 'edit' || (mode === 'test' && (feedback === 'correct' || feedback === 'wrong') && (feature.id === target?.id || feature.id === selectedId))
 
   return <main className={`app-shell ${darkMode ? 'dark-theme' : ''}`}>
     <header className="topbar"><div className="brand"><span className="brand-mark"><Compass size={18} /></span><span>atlas<span className="brand-accent">.</span>memo</span></div><div className="topbar-meta"><span className={`status-dot ${saveStatus === 'error' ? 'status-error' : ''}`} />{saveStatus === 'saving' ? 'Ukládám…' : saveStatus === 'error' ? 'Nepodařilo se uložit' : 'Uloženo'}<span className={`auth-status ${authStatus === 'error' ? 'auth-error' : ''}`} title={authError || (firebaseUser ? `Firebase UID: ${firebaseUser.uid}` : undefined)}>{authStatus === 'checking' ? 'Ověřuji profil…' : authStatus === 'signing-in' ? 'Přihlašuji…' : authStatus === 'signing-out' ? 'Odhlašuji…' : authStatus === 'unconfigured' ? 'Firebase nenastaven' : authStatus === 'error' ? 'Chyba přihlášení' : firebaseUser ? <><span>{firebaseUser.email || firebaseUser.displayName || 'Přihlášeno'}</span><small>UID: {firebaseUser.uid}</small></> : 'Nepřihlášeno'}</span><button className="avatar" onClick={handleProfileAction} disabled={!isFirebaseConfigured || authStatus === 'checking' || authStatus === 'signing-in' || authStatus === 'signing-out'} aria-label={firebaseUser ? `Odhlásit účet ${firebaseUser.email || ''}, Firebase UID ${firebaseUser.uid}` : 'Přihlásit se přes Google'} title={authError || (authStatus === 'unconfigured' ? 'Nejdřív nastav VITE_FIREBASE_* v .env.local.' : firebaseUser ? `Odhlásit se · Firebase UID: ${firebaseUser.uid}` : 'Přihlásit se přes Google')}>{authStatus === 'signing-in' || authStatus === 'signing-out' ? '…' : firebaseUser ? (firebaseUser.displayName?.trim().charAt(0).toUpperCase() || firebaseUser.email?.charAt(0).toUpperCase() || 'U') : 'G'}</button></div></header>
@@ -683,27 +674,12 @@ function App() {
         {mode === 'test' && !target && <div className="quiz-banner complete"><strong>Test dokončen</strong><span>{stats.correct} / {stats.answered} správně · úspěšnost {stats.success} %</span><button onClick={startTest} className="next-button">Testovat znovu →</button></div>}
         <div className={`map-card ${isFullscreen ? 'map-card-fullscreen' : ''}`}><MapContainer key={project.id} center={continent.center} zoom={continent.zoom} minZoom={2} scrollWheelZoom zoomControl={false} className="map"><MapViewport onMapClick={answer} onFullscreen={handleFullscreen} resetView={{ center: continent.center, zoom: continent.zoom }} viewKey={project.id} mapLayer={project.mapLayer} isFullscreen={isFullscreen}>{project.mapLayer === 'normal' && <TileLayer attribution="&copy; OpenStreetMap contributors" url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />}{project.mapLayer === 'blind' && boundaryData && <GeoJSON data={boundaryData} interactive={false} style={{ color: '#8ca69b', weight: 1, fillColor: '#dfece4', fillOpacity: 0 }} />}
           <div className="map-layer-control" role="group" aria-label="Podklad mapy"><button className={project.mapLayer === 'blind' ? 'active' : ''} onClick={() => handleLayer('blind')}>Slepá mapa</button><button className={project.mapLayer === 'normal' ? 'active' : ''} onClick={() => handleLayer('normal')}>Normální mapa</button></div>
-          {project.features.map((feature) => {
-            const showShape = project.displayMode === 'shape' && feature.geometry && feature.geometry.type !== 'Point'
-            const isTarget = mode === 'test' && feature.id === target?.id
-            const isSelected = feature.id === selectedId
-            const neutral = mode === 'test' && feedback === 'idle'
-            const revealed = mode === 'test' && (feedback === 'correct' || feedback === 'wrong') && (isTarget || isSelected)
-            const hovered = hoveredId === feature.id
-            const color = neutral ? '#174b43' : isTarget ? '#3d8c70' : isSelected ? '#d85b45' : '#174b43'
-            const pathColor = neutral ? (hovered ? '#438b91' : '#75b7c1') : (hovered ? '#ed6a3a' : color)
-            const showTooltip = labelVisible(feature)
-            const permanentTooltip = mode === 'test' && revealed
-            const handlers = { click: (event: LeafletMouseEvent) => selectFeature(feature, event), mouseover: () => setHoveredId(feature.id), mouseout: () => setHoveredId((current) => current === feature.id ? null : current) }
-            return <span key={feature.id} className="feature-layer">
-              {showShape ? <GeometryLayer feature={feature} color={pathColor} fillColor={neutral ? '#a9d6d9' : color} tooltip={showTooltip} permanentTooltip={permanentTooltip} onSelect={(event) => selectFeature(feature, event)} onHover={(active) => setHoveredId(active ? feature.id : null)} /> : <CircleMarker center={[feature.lat, feature.lng]} radius={(revealed ? 9 : 7) + (hovered ? 2 : 0)} pathOptions={{ color: '#f7fbf4', weight: 3, fillColor: neutral ? '#174b43' : color, fillOpacity: 1 }} eventHandlers={handlers}>{showTooltip && <Tooltip direction="top" offset={[0, -7]} permanent={permanentTooltip}>{feature.name}</Tooltip>}</CircleMarker>}
-            </span>
-          })}
+          {project.features.map((feature) => <span key={feature.id} className="feature-layer"><FeatureMapItem feature={feature} displayMode={project.displayMode} mode={mode} feedback={feedback} targetId={target?.id} selectedId={selectedId} hovered={hoveredId === feature.id} onSelect={selectFeature} onHover={setFeatureHovered} /></span>)}
         </MapViewport></MapContainer><div className="map-overlay"><span><span className="legend-dot" /> {project.features.length} {project.features.length === 1 ? 'pojem' : 'pojmy'} na mapě</span><span className="map-source"><MapPin size={13} />{project.mapLayer === 'blind' ? 'Hranice: Natural Earth' : '© OpenStreetMap contributors'}</span></div></div>
         <div className="display-mode-control" role="group" aria-label="Zobrazení objektů"><span>Zobrazení objektů</span><button className={project.displayMode === 'shape' ? 'active' : ''} onClick={() => handleDisplayMode('shape')}>Tvar</button><button className={project.displayMode === 'points' ? 'active' : ''} onClick={() => handleDisplayMode('points')}>Body</button></div>
         {mode === 'edit' ? <div className="editor-grid"><div className="add-panel"><div className="panel-title"><span className="number-badge">01</span><div><h3>Přidej místo</h3><p>Vyhledej skutečné místo a vyber správný výsledek.</p></div></div><form onSubmit={searchPlaces} className="search-form"><div className="search-input"><Search size={17} /><input value={query} onChange={(event) => { setQuery(event.target.value); setNotice('') }} placeholder="Vyhledat místo..." autoComplete="off" aria-label="Vyhledat místo" aria-expanded={candidates.length > 0} aria-controls="place-suggestions" /><button type="button" aria-label="Vymazat hledání" onClick={() => { setQuery(''); setCandidates([]); setNotice('') }}><X size={15} /></button></div><div className="select-wrap"><select value={placeType} onChange={(event) => setPlaceType(event.target.value as PlaceType)}><option value="">Typ – volitelné</option><option>město</option><option>řeka</option><option>jezero</option><option>pohoří</option><option>stát</option><option>památka</option><option>jiný objekt</option></select><ChevronDown size={15} /></div><button className="add-button" disabled={isSearching}>{isSearching ? 'Hledám...' : <><Search size={16} /> Vyhledat</>}</button></form>{isSearching && query.trim().length >= 2 && <p className="search-status">Hledám návrhy…</p>}{candidates.length > 0 && <div id="place-suggestions" className="candidate-list" role="listbox" aria-label="Návrhy míst">{candidates.map((candidate) => <button type="button" role="option" aria-selected="false" key={candidate.place_id} onClick={() => addCandidate(candidate)}><MapPin size={15} /><span><strong>{getCandidateName(candidate)}</strong><small>{candidate.display_name}</small></span><Plus size={15} /></button>)}</div>}
         {notice && <p className={`notice ${notice.includes('nepodařilo') || notice.includes('existuje') || notice.includes('příliš velký') ? 'error' : ''}`}>{notice}</p>}
-        <p className="data-note"><Crosshair size={14} /> Hranice z dat Natural Earth · objekty ukládají dostupnou geometrii.</p></div><div className="places-panel"><div className="list-heading"><div><span className="section-label">TVOJE POJMY</span><strong>{project.features.length} {project.features.length === 1 ? 'položka' : 'položek'}</strong></div><button onClick={clearFeatures} className="clear-button">Vymazat vše</button></div><div className="place-list">{project.features.length === 0 ? <div className="empty-state">Projekt je zatím prázdný.<br />Vyhledej první místo výše.</div> : project.features.map((feature, index) => <div className={`place-row ${selectedId === feature.id ? 'selected-row' : ''}`} key={feature.id} onClick={() => setSelectedId(feature.id)}><span className="row-index">{String(index + 1).padStart(2, '0')}</span><span className="place-pin"><MapPin size={14} /></span><div className="place-copy"><strong>{feature.name}</strong><span>{feature.type || 'bez typu'} · {feature.lat.toFixed(2)}°, {feature.lng.toFixed(2)}°{feature.geometry ? ' · geometrie' : ''}</span></div><button className="edit-button" aria-label={`Upravit ${feature.name}`} onClick={(event) => { event.stopPropagation(); editFeature(feature) }}><Pencil size={14} /></button><button className="delete-button" aria-label={`Odstranit ${feature.name}`} onClick={(event) => { event.stopPropagation(); removeFeature(feature.id) }}><Trash2 size={15} /></button></div>)}</div></div></div> : <div className="stats-panel"><div><span className="section-label">STATISTIKY PROJEKTU</span><strong>{stats.total} pojmů</strong></div><div><strong>{stats.answered}</strong><span>zodpovězeno</span></div><div><strong>{stats.correct}</strong><span>správně</span></div><div><strong>{stats.wrong}</strong><span>špatně</span></div><div><strong>{stats.success} %</strong><span>úspěšnost</span></div></div>}
+        <p className="data-note"><Crosshair size={14} /> Hranice z dat Natural Earth · objekty ukládají dostupnou geometrii.</p></div><div className="places-panel"><div className="list-heading"><div><span className="section-label">TVOJE POJMY</span><strong>{project.features.length} {project.features.length === 1 ? 'položka' : 'položek'}</strong></div><button onClick={clearFeatures} className="clear-button">Vymazat vše</button></div><div className="place-list">{project.features.length === 0 ? <div className="empty-state">Projekt je zatím prázdný.<br />Vyhledej první místo výše.</div> : project.features.map((feature, index) => <ProjectPlaceRow key={feature.id} feature={feature} index={index} selected={selectedId === feature.id} onSelect={selectPlaceRow} onEdit={editFeature} onRemove={removeFeature} />)}</div></div></div> : <div className="stats-panel"><div><span className="section-label">STATISTIKY PROJEKTU</span><strong>{stats.total} pojmů</strong></div><div><strong>{stats.answered}</strong><span>zodpovězeno</span></div><div><strong>{stats.correct}</strong><span>správně</span></div><div><strong>{stats.wrong}</strong><span>špatně</span></div><div><strong>{stats.success} %</strong><span>úspěšnost</span></div></div>}
       </section>
     </div>
     {showCreate && <div className="modal-backdrop" onClick={() => setShowCreate(false)}><div className="modal" onClick={(event) => event.stopPropagation()}><div className="modal-heading"><div><span className="eyebrow">NOVÝ PROJEKT</span><h3>Vytvoř vlastní mapu</h3></div><button className="icon-button" onClick={() => setShowCreate(false)}><X size={16} /></button></div><label>Název projektu<input autoFocus value={newProjectName} onChange={(event) => setNewProjectName(event.target.value)} placeholder="Např. Řeky Evropy" /></label><label>Kontinent<select value={newProjectContinent} onChange={(event) => setNewProjectContinent(event.target.value as Continent)}>{(Object.keys(continentData) as Continent[]).map((key) => <option key={key} value={key}>{continentData[key].label}</option>)}</select></label><button className="add-button modal-submit" onClick={createProject}><Plus size={16} /> Vytvořit projekt</button></div></div>}
