@@ -3,6 +3,7 @@ import { GeoJSON, MapContainer, TileLayer, useMap, useMapEvents } from 'react-le
 import { Check, ChevronDown, Compass, Crosshair, Expand, MapPin, Moon, Pencil, Plus, Search, Share2, Sparkles, Sun, Target, Trash2, X } from 'lucide-react'
 import type { User } from 'firebase/auth'
 import type { Geometry as GeoJsonGeometry, GeoJsonObject, Position } from 'geojson'
+import { svg } from 'leaflet'
 import type { LeafletMouseEvent, LatLng, LatLngBoundsExpression, LatLngLiteral, Map as LeafletMap } from 'leaflet'
 import { isFirebaseConfigured } from './lib/firebaseConfig'
 import { normalizeProject, parseProjectStore, STORE_KEY } from './projectModel'
@@ -11,6 +12,10 @@ import type { CloudProject, ProjectRepository } from './projectRepository'
 import type { Continent, Feature, PlaceType, Project, Store } from './projectModel'
 import { FeatureMapItem } from './FeatureMapItem'
 import { ProjectPlaceRow } from './ProjectPlaceRow'
+import { MapRenderContext } from './MapRenderContext'
+import { countFeatureGeometryPositions } from './geometryRender'
+import { FullscreenTestContext } from './FullscreenTestContext'
+import { getQuizContext } from './testProgress'
 import { decodeSharedProject, encodeSharedProject, SHARE_URL_LIMIT } from './shareCodec'
 import './App.css'
 import './theme.css'
@@ -159,13 +164,21 @@ function MapViewport({ children, resetView, viewKey, mapLayer, isFullscreen, onM
   const resetLat = resetView.center.lat
   const resetLng = resetView.center.lng
   const resetZoom = resetView.zoom
-  useMapEvents({ click: (event) => onMapClick({ ...event, map }) })
+  const [zoom, setZoom] = useState(resetZoom)
+  const hoverRenderer = useMemo(() => svg(), [])
+  const renderContext = useMemo(() => ({ zoom, hoverRenderer }), [zoom, hoverRenderer])
+  useMapEvents({
+    click: (event) => onMapClick({ ...event, map }),
+    zoomend: () => setZoom(map.getZoom()),
+  })
   useEffect(() => {
     map.setView([resetLat, resetLng], resetZoom)
+  }, [map, resetLat, resetLng, resetZoom, viewKey, mapLayer])
+  useEffect(() => {
     const frame = requestAnimationFrame(() => map.invalidateSize())
     return () => cancelAnimationFrame(frame)
-  }, [map, resetLat, resetLng, resetZoom, viewKey, mapLayer, isFullscreen])
-  return <><div className="map-controls"><button onClick={() => map.zoomIn()} aria-label="Přiblížit">+</button><button onClick={() => map.zoomOut()} aria-label="Oddálit">−</button><button onClick={() => map.setView(resetView.center, resetView.zoom)} aria-label="Zobrazit celý kontinent"><Crosshair size={15} /></button><button onClick={onFullscreen} aria-label="Celá obrazovka"><Expand size={15} /></button></div>{children}</>
+  }, [map, isFullscreen])
+  return <><div className="map-controls"><button onClick={() => map.zoomIn()} aria-label="Přiblížit">+</button><button onClick={() => map.zoomOut()} aria-label="Oddálit">−</button><button onClick={() => map.setView(resetView.center, resetView.zoom)} aria-label="Zobrazit celý kontinent"><Crosshair size={15} /></button><button onClick={onFullscreen} aria-label="Celá obrazovka"><Expand size={15} /></button></div><MapRenderContext.Provider value={renderContext}>{children}</MapRenderContext.Provider></>
 }
 
 function App() {
@@ -209,8 +222,13 @@ function App() {
   const firebaseAuthRef = useRef<FirebaseAuthModule | null>(null)
   const project = store.projects.find((item) => item.id === store.activeProjectId) ?? store.projects[0]
   const continent = continentData[project.continent]
-  const target = project.features.find((feature) => feature.id === project.testOrder[project.testIndex])
+  const quizContext = useMemo(() => getQuizContext(project, project.testIndex, feedback), [project, feedback])
+  const target = quizContext.target
   const stats = useMemo(() => ({ ...project.stats, total: project.features.length, success: project.stats.answered ? Math.round((project.stats.correct / project.stats.answered) * 100) : 0 }), [project.features.length, project.stats])
+  const geometryMetrics = useMemo(() => project.features.reduce((metrics, feature) => {
+    const count = countFeatureGeometryPositions([feature.geometry])
+    return { totalPositions: metrics.totalPositions + count, featuresWithGeometry: metrics.featuresWithGeometry + Number(count > 0), largestFeaturePositions: Math.max(metrics.largestFeaturePositions, count) }
+  }, { totalPositions: 0, featuresWithGeometry: 0, largestFeaturePositions: 0 }), [project.features])
 
   useEffect(() => {
     let result: 'saved' | 'error' = 'saved'
@@ -220,6 +238,9 @@ function App() {
     return () => window.clearTimeout(timer)
   }, [store])
   useEffect(() => { storeRef.current = store }, [store])
+  useEffect(() => {
+    if (import.meta.env.DEV) console.info('[Map performance] Source geometry metrics', { featureCount: project.features.length, ...geometryMetrics })
+  }, [project.features.length, geometryMetrics])
   useEffect(() => {
     const retryPendingSync = () => setSyncTick((value) => value + 1)
     window.addEventListener('online', retryPendingSync)
@@ -651,7 +672,7 @@ function App() {
     if (!nearest || !Number.isFinite(nearest.distance)) { setFeedback('far'); return }
     evaluateFeature(nearest.feature)
   }
-  const handleFullscreen = () => setIsFullscreen((value) => !value)
+  const handleFullscreen = useCallback(() => setIsFullscreen((value) => !value), [])
   const handleLayer = (layer: Project['mapLayer']) => updateProject((current) => ({ ...current, mapLayer: layer }))
   const handleDisplayMode = (displayMode: Project['displayMode']) => updateProject((current) => ({ ...current, displayMode }))
 
@@ -672,10 +693,10 @@ function App() {
       <section className={`main-panel ${isFullscreen ? 'fullscreen-panel' : ''}`}><div className="content-header"><div><span className="eyebrow">PRACOVNÍ PROSTOR / {continent.label.toUpperCase()}</span><h2>{mode === 'edit' ? project.name : 'Najdi správné místo'}</h2><p>{mode === 'edit' ? 'Vytvoř si vlastní sbírku míst k procvičení.' : 'Klikni přímo na bod nebo objekt, který odpovídá zadání.'}</p></div><div className="header-actions"><button className="subtle-button" onClick={renameProject}><Pencil size={14} /> Přejmenovat</button><button className="subtle-button" onClick={shareProject}><Share2 size={14} /> Sdílet</button><button className="mode-button" onClick={deleteProject} aria-label="Smazat projekt"><Trash2 size={14} /></button><button className={`mode-button ${mode === 'edit' ? 'selected' : ''}`} onClick={() => { setMode('edit'); setFeedback('idle'); setSelectedId(null) }}><Pencil size={15} /> Upravit mapu</button><button className={`mode-button test ${mode === 'test' ? 'selected' : ''}`} onClick={startTest}><Target size={15} /> Testovat</button></div></div>
         {mode === 'test' && target && <div className={`quiz-banner ${feedback}`}><div className="quiz-label"><Target size={17} /><span>AKTUÁLNÍ ÚKOL</span></div><strong>Najdi: {target.name}</strong>{feedback === 'idle' && <span className="quiz-help">Objekty nemají popisky, dokud neodpovíš.</span>}{feedback === 'far' && <span className="feedback-text">Klikni na jeden z objektů na mapě.</span>}{feedback === 'correct' && <span className="feedback-text"><Check size={16} /> Správně!</span>}{feedback === 'wrong' && <span className="feedback-text">Špatně. Klikla jsi na „{project.features.find((feature) => feature.id === selectedId)?.name}“.</span>}{feedback !== 'idle' && feedback !== 'far' && <button onClick={nextQuestion} className="next-button">{project.testIndex + 1 >= project.testOrder.length ? 'Zobrazit shrnutí' : 'Další otázka'} <span>→</span></button>}</div>}
         {mode === 'test' && !target && <div className="quiz-banner complete"><strong>Test dokončen</strong><span>{stats.correct} / {stats.answered} správně · úspěšnost {stats.success} %</span><button onClick={startTest} className="next-button">Testovat znovu →</button></div>}
-        <div className={`map-card ${isFullscreen ? 'map-card-fullscreen' : ''}`}><MapContainer key={project.id} center={continent.center} zoom={continent.zoom} minZoom={2} scrollWheelZoom zoomControl={false} className="map"><MapViewport onMapClick={answer} onFullscreen={handleFullscreen} resetView={{ center: continent.center, zoom: continent.zoom }} viewKey={project.id} mapLayer={project.mapLayer} isFullscreen={isFullscreen}>{project.mapLayer === 'normal' && <TileLayer attribution="&copy; OpenStreetMap contributors" url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />}{project.mapLayer === 'blind' && boundaryData && <GeoJSON data={boundaryData} interactive={false} style={{ color: '#8ca69b', weight: 1, fillColor: '#dfece4', fillOpacity: 0 }} />}
+        <div className={`map-card ${isFullscreen ? 'map-card-fullscreen' : ''}`}><MapContainer key={project.id} center={continent.center} zoom={continent.zoom} minZoom={2} scrollWheelZoom zoomControl={false} preferCanvas className="map"><MapViewport onMapClick={answer} onFullscreen={handleFullscreen} resetView={{ center: continent.center, zoom: continent.zoom }} viewKey={project.id} mapLayer={project.mapLayer} isFullscreen={isFullscreen}>{project.mapLayer === 'normal' && <TileLayer attribution="&copy; OpenStreetMap contributors" url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />}{project.mapLayer === 'blind' && boundaryData && <GeoJSON data={boundaryData} interactive={false} style={{ color: '#8ca69b', weight: 1, fillColor: '#dfece4', fillOpacity: 0 }} />}
           <div className="map-layer-control" role="group" aria-label="Podklad mapy"><button className={project.mapLayer === 'blind' ? 'active' : ''} onClick={() => handleLayer('blind')}>Slepá mapa</button><button className={project.mapLayer === 'normal' ? 'active' : ''} onClick={() => handleLayer('normal')}>Normální mapa</button></div>
           {project.features.map((feature) => <span key={feature.id} className="feature-layer"><FeatureMapItem feature={feature} displayMode={project.displayMode} mode={mode} feedback={feedback} targetId={target?.id} selectedId={selectedId} hovered={hoveredId === feature.id} onSelect={selectFeature} onHover={setFeatureHovered} /></span>)}
-        </MapViewport></MapContainer><div className="map-overlay"><span><span className="legend-dot" /> {project.features.length} {project.features.length === 1 ? 'pojem' : 'pojmy'} na mapě</span><span className="map-source"><MapPin size={13} />{project.mapLayer === 'blind' ? 'Hranice: Natural Earth' : '© OpenStreetMap contributors'}</span></div></div>
+        </MapViewport></MapContainer><div className="map-overlay"><span><span className="legend-dot" /> {project.features.length} {project.features.length === 1 ? 'pojem' : 'pojmy'} na mapě</span><span className="map-source"><MapPin size={13} />{project.mapLayer === 'blind' ? 'Hranice: Natural Earth' : '© OpenStreetMap contributors'}</span></div>{isFullscreen && mode === 'test' && <FullscreenTestContext context={quizContext} onClose={handleFullscreen} />}</div>
         <div className="display-mode-control" role="group" aria-label="Zobrazení objektů"><span>Zobrazení objektů</span><button className={project.displayMode === 'shape' ? 'active' : ''} onClick={() => handleDisplayMode('shape')}>Tvar</button><button className={project.displayMode === 'points' ? 'active' : ''} onClick={() => handleDisplayMode('points')}>Body</button></div>
         {mode === 'edit' ? <div className="editor-grid"><div className="add-panel"><div className="panel-title"><span className="number-badge">01</span><div><h3>Přidej místo</h3><p>Vyhledej skutečné místo a vyber správný výsledek.</p></div></div><form onSubmit={searchPlaces} className="search-form"><div className="search-input"><Search size={17} /><input value={query} onChange={(event) => { setQuery(event.target.value); setNotice('') }} placeholder="Vyhledat místo..." autoComplete="off" aria-label="Vyhledat místo" aria-expanded={candidates.length > 0} aria-controls="place-suggestions" /><button type="button" aria-label="Vymazat hledání" onClick={() => { setQuery(''); setCandidates([]); setNotice('') }}><X size={15} /></button></div><div className="select-wrap"><select value={placeType} onChange={(event) => setPlaceType(event.target.value as PlaceType)}><option value="">Typ – volitelné</option><option>město</option><option>řeka</option><option>jezero</option><option>pohoří</option><option>stát</option><option>památka</option><option>jiný objekt</option></select><ChevronDown size={15} /></div><button className="add-button" disabled={isSearching}>{isSearching ? 'Hledám...' : <><Search size={16} /> Vyhledat</>}</button></form>{isSearching && query.trim().length >= 2 && <p className="search-status">Hledám návrhy…</p>}{candidates.length > 0 && <div id="place-suggestions" className="candidate-list" role="listbox" aria-label="Návrhy míst">{candidates.map((candidate) => <button type="button" role="option" aria-selected="false" key={candidate.place_id} onClick={() => addCandidate(candidate)}><MapPin size={15} /><span><strong>{getCandidateName(candidate)}</strong><small>{candidate.display_name}</small></span><Plus size={15} /></button>)}</div>}
         {notice && <p className={`notice ${notice.includes('nepodařilo') || notice.includes('existuje') || notice.includes('příliš velký') ? 'error' : ''}`}>{notice}</p>}

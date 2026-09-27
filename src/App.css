@@ -13,6 +13,20 @@
 .candidate-list { max-height:280px; overflow-y:auto; box-shadow:0 8px 24px rgba(23,60,56,.1); }
 .candidate-list button:hover,
 .candidate-list button:focus-visible { background:var(--mint); outline:none; }
+.fullscreen-test-context { position:absolute; z-index:1002; top:58px; left:12px; width:min(310px,calc(100vw - 24px)); max-height:min(52vh,520px); display:flex; flex-direction:column; overflow:hidden; border:1px solid rgba(219,229,223,.95); border-radius:10px; background:rgba(255,255,255,.94); color:var(--ink); box-shadow:0 12px 34px rgba(23,60,56,.18); backdrop-filter:blur(12px); }
+.fullscreen-test-context>header { display:flex; align-items:flex-start; justify-content:space-between; gap:10px; padding:13px 14px 10px; border-bottom:1px solid var(--line); }
+.fullscreen-test-context>header strong { display:block; margin-top:5px; font-size:13px; }
+.fullscreen-test-context>header button { flex:none; border:0; background:transparent; color:var(--muted); font-size:22px; line-height:1; }
+.fullscreen-test-context ol { overflow:auto; list-style:none; margin:0; padding:4px 0; }
+.fullscreen-test-context li { display:flex; align-items:center; gap:8px; min-height:30px; padding:5px 13px; color:#75847f; font-size:11px; }
+.fullscreen-test-context li[aria-current='step'] { background:var(--mint); color:var(--green); font-weight:800; }
+.fullscreen-test-context .quiz-item-answered .quiz-item-status,.fullscreen-test-context .quiz-item-correct .quiz-item-status { color:#4e9270; }
+.fullscreen-test-context .quiz-item-wrong .quiz-item-status { color:var(--red); }
+.fullscreen-test-context .quiz-item-status { width:14px; flex:none; text-align:center; font-weight:800; }
+.fullscreen-test-context>small { padding:9px 13px 11px; border-top:1px solid var(--line); color:var(--muted); font-size:10px; }
+.dark-theme .fullscreen-test-context { background:rgba(20,43,39,.95); border-color:#38574e; color:#e7f0eb; }
+.dark-theme .fullscreen-test-context>header { border-color:#38574e; }
+.dark-theme .fullscreen-test-context li[aria-current='step'] { background:#29483d; color:#e7f0eb; }
 .sync-card { display:grid; gap:9px; margin:18px 0 20px; padding:13px; border:1px solid var(--line); border-radius:9px; background:rgba(255,255,255,.72); color:var(--muted); font-size:11px; line-height:1.5; }
 .sync-card strong { color:var(--green); font-size:12px; line-height:1.4; }
 .sync-card button { border:0; border-radius:6px; background:var(--green); color:#fff; padding:8px 9px; font-size:10px; font-weight:700; line-height:1.35; text-align:left; }
