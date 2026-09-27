@@ -63,6 +63,99 @@ const simplifyPath = (positions: Position[], project: ProjectPosition, tolerance
 
 export const getRenderTolerance = (zoom: number) => Math.max(.35, Math.min(1.5, 1.5 - zoom * .065))
 
+export const getRenderZoomBucket = (zoom: number) => Math.round(zoom * 2) / 2
+
+const renderGeometryCache = new WeakMap<Geometry, Map<number, Geometry>>()
+const geometryBoundsCache = new WeakMap<Geometry, GeometryBounds>()
+const geometryPositionCountCache = new WeakMap<Geometry, number>()
+const MAX_CACHED_ZOOM_BUCKETS_PER_GEOMETRY = 8
+let geometryRenderStats = { computations: 0, cacheHits: 0, sourcePositions: 0, renderedPositions: 0, computeMilliseconds: 0 }
+
+export type GeometryRenderDiagnostics = typeof geometryRenderStats
+
+export const getGeometryRenderDiagnostics = (): GeometryRenderDiagnostics => ({ ...geometryRenderStats })
+export const resetGeometryRenderDiagnostics = () => { geometryRenderStats = { computations: 0, cacheHits: 0, sourcePositions: 0, renderedPositions: 0, computeMilliseconds: 0 } }
+
+export const getCachedRenderGeometry = (geometry: Geometry, project: ProjectPosition, zoom: number): Geometry => {
+  const bucket = getRenderZoomBucket(zoom)
+  let geometryCache = renderGeometryCache.get(geometry)
+  const cached = geometryCache?.get(bucket)
+  if (cached) {
+    geometryRenderStats.cacheHits++
+    return cached
+  }
+  const startedAt = typeof performance === 'undefined' ? Date.now() : performance.now()
+  const rendered = simplifyGeometryForRender(geometry, project, getRenderTolerance(bucket))
+  const finishedAt = typeof performance === 'undefined' ? Date.now() : performance.now()
+  geometryRenderStats.computations++
+  geometryRenderStats.sourcePositions += countGeometryPositions(geometry)
+  geometryRenderStats.renderedPositions += countGeometryPositions(rendered)
+  geometryRenderStats.computeMilliseconds += finishedAt - startedAt
+  if (!geometryCache) {
+    geometryCache = new Map()
+    renderGeometryCache.set(geometry, geometryCache)
+  }
+  geometryCache.set(bucket, rendered)
+  if (geometryCache.size > MAX_CACHED_ZOOM_BUCKETS_PER_GEOMETRY) {
+    const oldestBucket = geometryCache.keys().next().value
+    if (oldestBucket !== undefined) geometryCache.delete(oldestBucket)
+  }
+  return rendered
+}
+
+export type GeometryBounds = { south: number; north: number; west: number; east: number }
+export type GeographicViewport = GeometryBounds
+
+const extendBounds = (bounds: GeometryBounds, position: Position) => {
+  bounds.south = Math.min(bounds.south, position[1])
+  bounds.north = Math.max(bounds.north, position[1])
+  bounds.west = Math.min(bounds.west, position[0])
+  bounds.east = Math.max(bounds.east, position[0])
+}
+
+const extendGeometryBounds = (geometry: Geometry, bounds: GeometryBounds) => {
+  switch (geometry.type) {
+    case 'Point': extendBounds(bounds, geometry.coordinates); break
+    case 'MultiPoint':
+    case 'LineString': geometry.coordinates.forEach((position) => extendBounds(bounds, position)); break
+    case 'MultiLineString':
+    case 'Polygon': geometry.coordinates.forEach((line) => line.forEach((position) => extendBounds(bounds, position))); break
+    case 'MultiPolygon': geometry.coordinates.forEach((polygon) => polygon.forEach((ring) => ring.forEach((position) => extendBounds(bounds, position)))); break
+    case 'GeometryCollection': geometry.geometries.forEach((child) => extendGeometryBounds(child, bounds)); break
+  }
+}
+
+export const getGeometryBounds = (geometry: Geometry): GeometryBounds => {
+  const cached = geometryBoundsCache.get(geometry)
+  if (cached) return cached
+  const bounds = { south: Number.POSITIVE_INFINITY, north: Number.NEGATIVE_INFINITY, west: Number.POSITIVE_INFINITY, east: Number.NEGATIVE_INFINITY }
+  extendGeometryBounds(geometry, bounds)
+  geometryBoundsCache.set(geometry, bounds)
+  return bounds
+}
+
+const longitudeIntervalsOverlap = (geometryWest: number, geometryEast: number, viewportWest: number, viewportEast: number) => {
+  for (const offset of [-720, -360, 0, 360, 720]) {
+    if (geometryEast + offset >= viewportWest && geometryWest + offset <= viewportEast) return true
+  }
+  return false
+}
+
+export const geometryIntersectsViewport = (geometry: Geometry, viewport: GeographicViewport) => {
+  const bounds = getGeometryBounds(geometry)
+  return bounds.north >= viewport.south
+    && bounds.south <= viewport.north
+    && longitudeIntervalsOverlap(bounds.west, bounds.east, viewport.west, viewport.east)
+}
+
+export const positionIsInViewport = (latitude: number, longitude: number, viewport: GeographicViewport) => latitude >= viewport.south
+  && latitude <= viewport.north
+  && longitudeIntervalsOverlap(longitude, longitude, viewport.west, viewport.east)
+
+export const getFeatureLabelAnchor = (feature: { lat: number; lng: number; geometry?: Geometry }, showLabel: boolean): [number, number] | null => showLabel && feature.geometry && feature.geometry.type !== 'Point'
+  ? [feature.lat, feature.lng]
+  : null
+
 export const simplifyGeometryForRender = (geometry: Geometry, project: ProjectPosition, tolerance: number): Geometry => {
   switch (geometry.type) {
     case 'LineString': return { ...geometry, coordinates: simplifyPath(geometry.coordinates, project, tolerance, false) }
@@ -75,8 +168,7 @@ export const simplifyGeometryForRender = (geometry: Geometry, project: ProjectPo
   }
 }
 
-export const countGeometryPositions = (geometry: Geometry | undefined): number => {
-  if (!geometry) return 0
+const countGeometryPositionsUncached = (geometry: Geometry): number => {
   switch (geometry.type) {
     case 'Point': return 1
     case 'MultiPoint':
@@ -86,6 +178,15 @@ export const countGeometryPositions = (geometry: Geometry | undefined): number =
     case 'MultiPolygon': return geometry.coordinates.reduce((total, polygon) => total + polygon.reduce((polygonTotal, ring) => polygonTotal + ring.length, 0), 0)
     case 'GeometryCollection': return geometry.geometries.reduce((total, child) => total + countGeometryPositions(child), 0)
   }
+}
+
+export const countGeometryPositions = (geometry: Geometry | undefined): number => {
+  if (!geometry) return 0
+  const cached = geometryPositionCountCache.get(geometry)
+  if (cached !== undefined) return cached
+  const count = countGeometryPositionsUncached(geometry)
+  geometryPositionCountCache.set(geometry, count)
+  return count
 }
 
 export const countFeatureGeometryPositions = (geometries: Array<Geometry | undefined>) => geometries.reduce((total, geometry) => total + countGeometryPositions(geometry), 0)

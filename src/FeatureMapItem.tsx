@@ -1,4 +1,4 @@
-import { memo, useCallback, useContext, useMemo } from 'react'
+import { memo, useCallback, useContext, useMemo, useState, useSyncExternalStore } from 'react'
 import { CircleMarker, Polygon, Polyline, Tooltip } from 'react-leaflet'
 import type { Geometry as GeoJsonGeometry, Position } from 'geojson'
 import type { LeafletMouseEvent, LatLngExpression, PathOptions } from 'leaflet'
@@ -6,7 +6,7 @@ import { useMap } from 'react-leaflet'
 import type { Feature, Project } from './projectModel'
 import { getFeaturePresentation } from './featurePresentation'
 import { MapRenderContext } from './MapRenderContext'
-import { getRenderTolerance, simplifyGeometryForRender } from './geometryRender'
+import { getCachedRenderGeometry, getFeatureLabelAnchor, getRenderZoomBucket } from './geometryRender'
 
 type FeatureMapItemProps = {
   feature: Feature
@@ -15,9 +15,7 @@ type FeatureMapItemProps = {
   feedback: 'idle' | 'correct' | 'wrong' | 'far'
   targetId: string | undefined
   selectedId: string | null
-  hovered: boolean
   onSelect: (feature: Feature, event: LeafletMouseEvent) => void
-  onHover: (featureId: string, active: boolean) => void
 }
 
 const coordsToLatLng = (positions: Position[]): LatLngExpression[] => positions.map(([lng, lat]) => [lat, lng] as LatLngExpression)
@@ -37,22 +35,28 @@ const geometryPositions = (geometry: GeoJsonGeometry | undefined): ConvertedGeom
   }
 }
 
-function FeatureMapItemComponent({ feature, displayMode, mode, feedback, targetId, selectedId, hovered, onSelect, onHover }: FeatureMapItemProps) {
+function FeatureMapItemComponent({ feature, displayMode, mode, feedback, targetId, selectedId, onSelect }: FeatureMapItemProps) {
   const map = useMap()
   const renderContext = useContext(MapRenderContext)
   if (!renderContext) throw new Error('FeatureMapItem must be rendered inside MapRenderContext.')
   const { zoom, hoverRenderer } = renderContext
+  const [hovered, setHovered] = useState(false)
   const presentation = getFeaturePresentation({ feature, displayMode, mode, feedback, targetId, selectedId, hovered })
-  const renderGeometry = useMemo(() => feature.geometry ? simplifyGeometryForRender(
+  const labelAnchor = getFeatureLabelAnchor(feature, presentation.showShape && presentation.showTooltip)
+  const zoomBucket = getRenderZoomBucket(zoom)
+  const subscribeVisibility = useCallback((listener: () => void) => renderContext.viewportStore.subscribe(feature.id, feature.geometry, feature.lat, feature.lng, listener), [renderContext.viewportStore, feature.id, feature.geometry, feature.lat, feature.lng])
+  const getVisibilitySnapshot = useCallback(() => renderContext.viewportStore.isFeatureVisible(feature.id, feature.geometry, feature.lat, feature.lng), [renderContext.viewportStore, feature.id, feature.geometry, feature.lat, feature.lng])
+  const visible = useSyncExternalStore(subscribeVisibility, getVisibilitySnapshot, getVisibilitySnapshot)
+  const renderGeometry = useMemo(() => visible && feature.geometry ? getCachedRenderGeometry(
     feature.geometry,
-    (position) => map.project([position[1], position[0]], zoom),
-    getRenderTolerance(zoom),
-  ) : undefined, [feature.geometry, map, zoom])
+    (position) => map.project([position[1], position[0]], zoomBucket),
+    zoomBucket,
+  ) : undefined, [visible, feature.geometry, map, zoomBucket])
   const positions = useMemo(() => geometryPositions(renderGeometry), [renderGeometry])
   const center = useMemo<LatLngExpression>(() => [feature.lat, feature.lng], [feature.lat, feature.lng])
   const select = useCallback((event: LeafletMouseEvent) => onSelect(feature, event), [feature, onSelect])
-  const hoverIn = useCallback(() => onHover(feature.id, true), [feature.id, onHover])
-  const hoverOut = useCallback(() => onHover(feature.id, false), [feature.id, onHover])
+  const hoverIn = useCallback(() => setHovered(true), [])
+  const hoverOut = useCallback(() => setHovered(false), [])
   const eventHandlers = useMemo(() => ({ click: select, mouseover: hoverIn, mouseout: hoverOut }), [select, hoverIn, hoverOut])
   const pointOptions = useMemo(() => ({
     color: '#f7fbf4',
@@ -68,27 +72,31 @@ function FeatureMapItemComponent({ feature, displayMode, mode, feedback, targetI
   const staticPointRadius = presentation.pointRadius - (hovered ? 2 : 0)
   const hoverPointOptions = useMemo(() => ({ color: '#f7fbf4', weight: 3, fillColor: presentation.neutral ? '#174b43' : presentation.color, fillOpacity: 0 }), [presentation.neutral, presentation.color])
 
-  const renderShape = (renderer: typeof hoverRenderer | undefined, lineStyle: PathOptions, polygonStyle: PathOptions, interactive: boolean, withTooltip: boolean) => {
+  if (!visible) return null
+
+  const renderShape = (renderer: typeof hoverRenderer | undefined, lineStyle: PathOptions, polygonStyle: PathOptions, interactive: boolean) => {
     if (!feature.geometry || !positions) return null
     const geometry = renderGeometry
     if (!geometry) return null
     const common = { renderer, eventHandlers: interactive ? eventHandlers : undefined, interactive }
-    const tooltip = withTooltip && presentation.showTooltip && <Tooltip sticky permanent={presentation.permanentTooltip}>{feature.name}</Tooltip>
-    if (geometry.type === 'LineString') return <Polyline positions={positions as LatLngExpression[]} pathOptions={lineStyle} {...common}>{tooltip}</Polyline>
-    if (geometry.type === 'MultiLineString') return <>{(positions as LatLngExpression[][]).map((line, index) => <Polyline key={index} positions={line} pathOptions={lineStyle} {...common}>{withTooltip && presentation.showTooltip && <Tooltip sticky permanent={presentation.permanentTooltip}>{feature.name}</Tooltip>}</Polyline>)}</>
-    if (geometry.type === 'Polygon') return <Polygon positions={positions as LatLngExpression[][]} pathOptions={polygonStyle} {...common}>{tooltip}</Polygon>
-    if (geometry.type === 'MultiPolygon') return <>{(positions as LatLngExpression[][][]).map((polygon, index) => <Polygon key={index} positions={polygon} pathOptions={polygonStyle} {...common}>{withTooltip && presentation.showTooltip && <Tooltip sticky permanent={presentation.permanentTooltip}>{feature.name}</Tooltip>}</Polygon>)}</>
+    if (geometry.type === 'LineString') return <Polyline positions={positions as LatLngExpression[]} pathOptions={lineStyle} {...common} />
+    if (geometry.type === 'MultiLineString') return <>{(positions as LatLngExpression[][]).map((line, index) => <Polyline key={index} positions={line} pathOptions={lineStyle} {...common} />)}</>
+    if (geometry.type === 'Polygon') return <Polygon positions={positions as LatLngExpression[][]} pathOptions={polygonStyle} {...common} />
+    if (geometry.type === 'MultiPolygon') return <>{(positions as LatLngExpression[][][]).map((polygon, index) => <Polygon key={index} positions={polygon} pathOptions={polygonStyle} {...common} />)}</>
     return null
   }
 
   if (presentation.showShape && feature.geometry) return <>
-    {renderShape(undefined, pathOptions, polygonOptions, true, true)}
-    {hovered && renderShape(hoverRenderer, hoverPathOptions, hoverPolygonOptions, false, false)}
+    {renderShape(undefined, pathOptions, polygonOptions, true)}
+    {hovered && renderShape(hoverRenderer, hoverPathOptions, hoverPolygonOptions, false)}
+    {labelAnchor && <CircleMarker center={labelAnchor} radius={1} pathOptions={{ opacity: 0, fillOpacity: 0, weight: 0 }} interactive={false}>
+      <Tooltip permanent>{feature.name}</Tooltip>
+    </CircleMarker>}
   </>
 
   return <>
     <CircleMarker center={center} radius={staticPointRadius} pathOptions={pointOptions} eventHandlers={eventHandlers}>
-      {presentation.showTooltip && <Tooltip direction="top" offset={[0, -7]} permanent={presentation.permanentTooltip}>{feature.name}</Tooltip>}
+      {presentation.showTooltip && <Tooltip direction="top" offset={[0, -7]} permanent>{feature.name}</Tooltip>}
     </CircleMarker>
     {hovered && <CircleMarker center={center} radius={staticPointRadius + 2} pathOptions={hoverPointOptions} renderer={hoverRenderer} interactive={false} />}
   </>

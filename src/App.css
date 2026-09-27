@@ -24,6 +24,7 @@
 .fullscreen-test-context .quiz-item-wrong .quiz-item-status { color:var(--red); }
 .fullscreen-test-context .quiz-item-status { width:14px; flex:none; text-align:center; font-weight:800; }
 .fullscreen-test-context>small { padding:9px 13px 11px; border-top:1px solid var(--line); color:var(--muted); font-size:10px; }
+.fullscreen-test-context .fullscreen-next { flex:none; margin:8px 12px; justify-content:center; }
 .dark-theme .fullscreen-test-context { background:rgba(20,43,39,.95); border-color:#38574e; color:#e7f0eb; }
 .dark-theme .fullscreen-test-context>header { border-color:#38574e; }
 .dark-theme .fullscreen-test-context li[aria-current='step'] { background:#29483d; color:#e7f0eb; }

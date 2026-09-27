@@ -14,9 +14,10 @@ export const getFeaturePresentation = ({ feature, displayMode, mode, feedback, t
   const showShape = displayMode === 'shape' && Boolean(feature.geometry && feature.geometry.type !== 'Point')
   const isTarget = mode === 'test' && feature.id === targetId
   const isSelected = feature.id === selectedId
-  const neutral = mode === 'test' && feedback === 'idle'
-  const revealed = mode === 'test' && (feedback === 'correct' || feedback === 'wrong') && (isTarget || isSelected)
-  const color = neutral ? '#174b43' : isTarget ? '#3d8c70' : isSelected ? '#d85b45' : '#174b43'
+  const answerRevealed = mode === 'test' && (feedback === 'correct' || feedback === 'wrong')
+  const neutral = mode === 'test' && !answerRevealed
+  const revealed = answerRevealed && (isTarget || isSelected)
+  const color = mode === 'test' && !answerRevealed ? '#174b43' : isTarget ? '#3d8c70' : isSelected ? '#d85b45' : '#174b43'
 
   return {
     showShape,
@@ -29,7 +30,7 @@ export const getFeaturePresentation = ({ feature, displayMode, mode, feedback, t
     pathColor: neutral ? (hovered ? '#438b91' : '#75b7c1') : (hovered ? '#ed6a3a' : color),
     fillColor: neutral ? '#a9d6d9' : color,
     pointRadius: (revealed ? 9 : 7) + (hovered ? 2 : 0),
-    showTooltip: mode === 'edit' || (mode === 'test' && (feedback === 'correct' || feedback === 'wrong') && (feature.id === targetId || feature.id === selectedId)),
-    permanentTooltip: mode === 'test' && revealed,
+    showTooltip: (mode === 'edit' && hovered) || revealed,
+    permanentTooltip: (mode === 'edit' && hovered) || (mode === 'test' && revealed),
   }
 }

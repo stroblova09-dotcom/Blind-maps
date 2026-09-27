@@ -19,3 +19,5 @@ export const getQuizContext = (project: Project, testIndex: number, feedback: Qu
   })
   return { projectId: project.id, testIndex, feedback, target, items }
 }
+
+export const advanceQuizState = (project: Project): Project => ({ ...project, testIndex: Math.min(project.testIndex + 1, project.testOrder.length) })
